@@ -7,12 +7,12 @@
 # make zip --- cleans and produces a zip file
 
 # Add files you want to go into your client library here.
-WATDFS_CLI_FILES= watdfs_client.cc temp.cc
-WATDFS_CLI_OBJS= watdfs_client.o temp.o
+WATDFS_CLI_FILES= watdfs_client.cc watdfs_client_utility.cc utility.cc
+WATDFS_CLI_OBJS= watdfs_client.o watdfs_client_utility.o utility.o
 
 # Add files you want to go into your server here.
-WATDFS_SERVER_FILES = server_main.cc watdfs_server.cc
-WATDFS_SERVER_OBJS = server_main.o watdfs_server.o
+WATDFS_SERVER_FILES = server_main.cc watdfs_server.cc utility.cc
+WATDFS_SERVER_OBJS = server_main.o watdfs_server.o utility.o
 # E.g. for A3 add rw_lock.c and rw_lock.o to the
 # WATDFS_SERVER_FILES and WATDFS_SERVER_OBJS respectively.
 

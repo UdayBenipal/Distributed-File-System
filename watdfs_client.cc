@@ -1,6 +1,6 @@
 #include "watdfs_client.h"
 #include "rpc.h"
-#include "argTypeFormatter.h"
+#include "utility.h"
 
 #include "debug.h"
 INIT_LOG
@@ -9,7 +9,7 @@ INIT_LOG
 #include <iostream>
 #endif
 
-#include "temp.h"
+#include "watdfs_client_utility.h"
 
 // SETUP AND TEARDOWN
 void *watdfs_cli_init(struct fuse_conn_info *conn, const char *path_to_cache,
@@ -146,35 +146,9 @@ int watdfs_cli_mknod(void *userdata, const char *path, mode_t mode, dev_t dev) {
 int watdfs_cli_open(void *userdata, const char *path, struct fuse_file_info *fi) {
     DLOG("watdfs_cli_open called for '%s'", path);
 
-    download_file(path);
-
-    int ARG_COUNT = 3;
-    void **args = new void*[ARG_COUNT];
-    int arg_types[ARG_COUNT + 1];
-
-    int pathlen = strlen(path) + 1;
-    arg_types[0] = argTypeFrmtr(yes, no, yes, ARG_CHAR, (uint) pathlen); //path
-    args[0] = (void *)path;
-
-    arg_types[1] = argTypeFrmtr(yes, yes, yes, ARG_CHAR, (uint) sizeof(struct fuse_file_info)); //fi
-    args[1] = (void *)(fi);
-
-    int *ret = (int *)malloc(sizeof(int)); *ret = 0;
-    arg_types[2] = argTypeFrmtr(no, yes, no, ARG_INT); //retcode
-    args[2] = (void *)ret;
-
-    arg_types[3] = 0;
-
-    int rpc_ret = rpcCall((char *)"open", arg_types, args);
-
-    int fxn_ret = 0;
-    if (rpc_ret < 0) { DLOG("open rpc failed with error '%d'", rpc_ret); fxn_ret = -EINVAL; }
-    else fxn_ret = *ret;
-
-    free(ret);
-    delete []args;
-
-    return fxn_ret;
+    int ret = 0;
+    ret = download_file(path, fi);
+    return ret;
 }
 
 int watdfs_cli_release(void *userdata, const char *path, struct fuse_file_info *fi) {

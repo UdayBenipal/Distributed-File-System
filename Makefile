@@ -7,8 +7,8 @@
 # make zip --- cleans and produces a zip file
 
 # Add files you want to go into your client library here.
-WATDFS_CLI_FILES= watdfs_client.cc
-WATDFS_CLI_OBJS= watdfs_client.o
+WATDFS_CLI_FILES= watdfs_client.cc temp.cc
+WATDFS_CLI_OBJS= watdfs_client.o temp.o
 
 # Add files you want to go into your server here.
 WATDFS_SERVER_FILES = server_main.cc watdfs_server.cc
@@ -23,7 +23,7 @@ CXXFLAGS += $(shell pkg-config --cflags fuse)
 CXXFLAGS += -g -Wall -std=c++1y -MMD
 
 # If you want to disable logging messages from DLOG, uncomment the next line.
-CXXFLAGS += -DNDEBUG
+# CXXFLAGS += -DNDEBUG
 
 # To stop error printing, comment out next line
 # CXXFLAGS += -DPRINT_ERR

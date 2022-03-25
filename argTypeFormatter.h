@@ -11,7 +11,8 @@ int argTypeFrmtr(bool input, bool output, bool array, unsigned int type, unsigne
     if (input) code = 1u << ARG_INPUT;
     if (output) code |= (1u << ARG_OUTPUT);
     if (array) code |= ((1u << ARG_ARRAY) | length);
-    return (code | (type << 16u));
+    code |= (type << 16u);
+    return code;
 }
 
 #endif

@@ -9,6 +9,8 @@ INIT_LOG
 #include <iostream>
 #endif
 
+#include "temp.h"
+
 // SETUP AND TEARDOWN
 void *watdfs_cli_init(struct fuse_conn_info *conn, const char *path_to_cache,
                       time_t cache_interval, int *ret_code) {
@@ -24,6 +26,8 @@ void *watdfs_cli_init(struct fuse_conn_info *conn, const char *path_to_cache,
         std::cerr << "Failed to initialize RPC Client" << std::endl;
 #endif
     }
+
+    set_path_to_cache(path_to_cache);
 
     // TODO Initialize any global state that you require for the assignment and return it.
     // The value that you return here will be passed as userdata in other functions.
@@ -141,6 +145,8 @@ int watdfs_cli_mknod(void *userdata, const char *path, mode_t mode, dev_t dev) {
 
 int watdfs_cli_open(void *userdata, const char *path, struct fuse_file_info *fi) {
     DLOG("watdfs_cli_open called for '%s'", path);
+
+    download_file(path);
 
     int ARG_COUNT = 3;
     void **args = new void*[ARG_COUNT];

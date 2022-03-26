@@ -10,7 +10,6 @@
 #include <errno.h>
 #include <fuse.h>
 #include <cstring>
-#include <cstdlib>
 
 // Important: the server needs to handle multiple concurrent client requests.
 // You have to be carefuly in handling global variables, esp. for updating them.
@@ -21,32 +20,14 @@ struct RegisterError {
     RegisterError(int code) : code(code) {} 
 };
 
-// Global state server_persist_dir.
-char *server_persist_dir = nullptr;
-
-void set_server_persist_dir(char * dir) { server_persist_dir = dir; }
-
-char *get_full_path(char *short_path) {
-    int short_path_len = strlen(short_path);
-    int dir_len = strlen(server_persist_dir);
-    int full_len = dir_len + short_path_len + 1;
-
-    char *full_path = (char *)malloc(full_len);
-
-    // First fill in the directory.
-    strcpy(full_path, server_persist_dir);
-    // Then append the path.
-    strcat(full_path, short_path);
-    DLOG("Full path: %s\n", full_path);
-
-    return full_path;
-}
+FileUtil fileUtil;
+void set_server_persist_dir(char *dir) { fileUtil.setDir(dir); }
 
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
 int watdfs_getattr(int *argTypes, void **args) {
-    char *short_path = (char *)args[0]; //the path relative to the mountpoint
-    char *full_path = get_full_path(short_path);
+    const char* short_path = (const char*)args[0]; //the path relative to the mountpoint
+    RAII<const char> full_path(fileUtil.getAbsolutePath(short_path));
 
     struct stat *statbuf = (struct stat *)args[1]; //stat structure
 
@@ -54,10 +35,9 @@ int watdfs_getattr(int *argTypes, void **args) {
     *ret = 0; // initially set the return code to be 0.
 
     int sys_ret = 0; // sys_ret the return code from the stat system call
-    sys_ret = stat(full_path, statbuf);
+    sys_ret = stat(full_path.ptr, statbuf);
     if (sys_ret < 0) *ret = -errno;
 
-    free(full_path); // Clean up the full path, it was allocated on the heap.
     DLOG("Returning code: %d", *ret);
     return 0;
 }
@@ -77,8 +57,8 @@ void watdfs_getattr_register() {
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
 int watdfs_mknod(int *argTypes, void **args) {
-    char *short_path = (char *)args[0];
-    char *full_path = get_full_path(short_path);
+    const char* short_path = (const char*)args[0];
+    RAII<const char> full_path(fileUtil.getAbsolutePath(short_path));
 
     mode_t* mode = (mode_t *)args[1];
 
@@ -88,10 +68,9 @@ int watdfs_mknod(int *argTypes, void **args) {
     *ret = 0;
 
     int sys_ret = 0;
-    sys_ret = mknod(full_path, *mode, *dev);
+    sys_ret = mknod(full_path.ptr, *mode, *dev);
     if (sys_ret < 0) *ret = -errno;
 
-    free(full_path);
     DLOG("Returning code: %d", *ret);
     return 0;
 }
@@ -112,19 +91,30 @@ void watdfs_mknod_register() {
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
 int watdfs_open(int *argTypes, void **args) {
-    char *short_path = (char *)args[0];
-    char *full_path = get_full_path(short_path);
+    const char* short_path = (const char*)args[0];
+    RAII<const char> full_path(fileUtil.getAbsolutePath(short_path));
 
     struct fuse_file_info *fi = (struct fuse_file_info *)args[1];
 
     int *ret = (int *)args[2];
     *ret = 0;
 
-    int sys_ret = 0;
-    sys_ret = open(full_path, fi->flags);
-    if (sys_ret < 0) *ret = -errno; else fi->fh = sys_ret;
+    AccessType accessType = processAccessType(fi->flags);
+    if (accessType == WRITE && fileUtil.openForWrite(short_path)) {
+        *ret = -EACCES;
+        DLOG("File already opended in write mode: %d", *ret);
+        return 0;
+    }
 
-    free(full_path);
+    int sys_ret = 0;
+    sys_ret = open(full_path.ptr, fi->flags);
+    if (sys_ret < 0) {
+        *ret = -errno;
+    } else {
+        fi->fh = sys_ret;
+        fileUtil.updateAccessType(short_path, accessType);
+    }
+
     DLOG("Returning code: %d", *ret);
     return 0;
 }
@@ -144,6 +134,8 @@ void watdfs_open_register() {
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
 int watdfs_release(int *argTypes, void **args) {
+    const char* short_path = (const char*)args[0]; //path
+
     struct fuse_file_info *fi = (struct fuse_file_info *)args[1]; //fi
 
     int *ret = (int *)args[2];
@@ -151,7 +143,14 @@ int watdfs_release(int *argTypes, void **args) {
 
     int sys_ret = 0;
     sys_ret = close(fi->fh);
-    if (sys_ret < 0) *ret = -errno; else fi->fh = sys_ret;
+    if (sys_ret < 0) {
+        *ret = -errno;
+    } else {
+        fi->fh = sys_ret;
+        if (fileUtil.openForWrite(short_path)) {
+            fileUtil.removeFile(short_path);
+        }
+    }
 
     DLOG("Returning code: %d", *ret);
     return 0;
@@ -244,8 +243,8 @@ void watdfs_write_register() {
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
 int watdfs_truncate(int *argTypes, void **args) {
-    char *short_path = (char *)args[0];
-    char *full_path = get_full_path(short_path);
+    const char* short_path = (const char*)args[0];
+    RAII<const char> full_path(fileUtil.getAbsolutePath(short_path));
 
     off_t *newsize = (off_t *)args[1];
 
@@ -253,10 +252,9 @@ int watdfs_truncate(int *argTypes, void **args) {
     *ret = 0;
 
     int sys_ret = 0;
-    sys_ret = truncate(full_path, *newsize);
+    sys_ret = truncate(full_path.ptr, *newsize);
     if (sys_ret < 0) *ret = -errno;
 
-    free(full_path);
     DLOG("Returning code: %d", *ret);
     return 0;
 }
@@ -304,8 +302,8 @@ void watdfs_fsync_register() {
 ///////////////////////////////////////////////////////////////////////////////////////////////////
 
 int watdfs_utimens(int *argTypes, void **args) {
-    char *short_path = (char *)args[0];
-    char *full_path = get_full_path(short_path);
+    const char* short_path = (const char*)args[0];
+    RAII<const char> full_path(fileUtil.getAbsolutePath(short_path));
 
     struct timespec *ts = (struct timespec *)args[1];
 
@@ -313,10 +311,9 @@ int watdfs_utimens(int *argTypes, void **args) {
     *ret = 0;
 
     int sys_ret = 0;
-    sys_ret = utimensat(-1, full_path, ts, 0);
+    sys_ret = utimensat(-1, full_path.ptr, ts, 0);
     if (sys_ret < 0) *ret = -errno;
 
-    free(full_path);
     DLOG("Returning code: %d", *ret);
     return 0;
 }

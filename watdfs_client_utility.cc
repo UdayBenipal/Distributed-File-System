@@ -12,34 +12,38 @@
 #include <time.h>
 #include <unistd.h>
 #include "rpc.h"
+#include "rw_lock.h"
 #include "watdfs_client_utility.h"
 
 #include "debug.h"
-
-#include "utility.h"
 
 //////////////////////////////////////////////////////////////////////////////////////////
 int getattr_from_server(const char *path, struct stat *statbuf);
 int open_from_server(const char *path, struct fuse_file_info *fi);
 int read_from_server(const char *path, char *buf, size_t size, struct fuse_file_info *fi);
 //////////////////////////////////////////////////////////////////////////////////////////
+int lock_on_server(const char *path, rw_lock_mode_t mode);
+int unlock_on_server(const char *path, rw_lock_mode_t mode);
+//////////////////////////////////////////////////////////////////////////////////////////
 
 
-FileUtil fileUtil;
-void set_path_to_cache(const char *path_to_cache) { fileUtil.setDir(path_to_cache); }
-
-
-int download_file(const char *path, struct fuse_file_info *fi) {
+int download_file(FileUtil& fileUtil, const char *path, struct fuse_file_info *fi) {
     RAII<const char> full_path(fileUtil.getAbsolutePath(path));
     DLOG("Download file: %s\n", full_path.ptr);
 
     int ret = 0;
 
+    ret = lock_on_server(path, RW_READ_LOCK);
+    if (ret < 0) {
+        DLOG("Failed to accquire lock on server: %d\n", -ret);
+        return ret;
+    }
     // open file on server based on provided flags
     // fi->fh will have server file descriptor
     ret = open_from_server(path, fi);
     if (ret < 0) {
-        DLOG("Failed to open/cretae file on server due to error: %d\n", -ret);
+        DLOG("Failed to open/create file on server due to error: %d\n", -ret);
+        unlock_on_server(path, RW_READ_LOCK);
         return ret;
     }
     DLOG("File Descriptor On Server: %ld\n", fi->fh);
@@ -50,14 +54,16 @@ int download_file(const char *path, struct fuse_file_info *fi) {
     ret = getattr_from_server(path, statbuf.ptr);
     if (ret < 0) {
         DLOG("Failed to get the attributes due to error: %d\n", -ret);
+        unlock_on_server(path, RW_READ_LOCK);
         return ret;
     }
     DLOG("Size: %ld\n", statbuf->st_size);
 
     // open/create file in client cache, truncate if it already exists
-    ret = open(full_path.ptr, O_CREAT|O_RDWR|O_TRUNC);
+    ret = open(full_path.ptr, O_CREAT|O_WRONLY|O_TRUNC);
     if (ret < 0) {
         DLOG("Unable to create/open file in client cache due to error: %d\n", errno);
+        unlock_on_server(path, RW_READ_LOCK);
         return -errno;
     }
     int fd_client = ret;
@@ -69,6 +75,7 @@ int download_file(const char *path, struct fuse_file_info *fi) {
         ret = read_from_server(path, buf, statbuf->st_size, fi);
         if (ret < 0) {
             DLOG("Failed to read from server due to error: %d\n", -ret);
+            unlock_on_server(path, RW_READ_LOCK);
             return ret;
         }
         DLOG("Buffer: %s\n", buf);
@@ -77,6 +84,7 @@ int download_file(const char *path, struct fuse_file_info *fi) {
         ret = write(fd_client, buf, statbuf->st_size);
         if (ret < 0) {
             DLOG("Unable to write in client cache due to error: %d\n", errno);
+            unlock_on_server(path, RW_READ_LOCK);
             return -errno;
         }
         delete []buf;
@@ -86,6 +94,7 @@ int download_file(const char *path, struct fuse_file_info *fi) {
     ret = fchmod(fd_client, statbuf->st_mode);
     if (ret < 0) {
         DLOG("Unable to update file permission metadata in client cache due to error: %d\n", errno);
+        unlock_on_server(path, RW_READ_LOCK);
         return -errno;
     }
 
@@ -93,14 +102,17 @@ int download_file(const char *path, struct fuse_file_info *fi) {
     ret = futimens(fd_client, times);
     if (ret < 0) {
         DLOG("Unable to update file time metadata in client cache due to error: %d\n", errno);
+        unlock_on_server(path, RW_READ_LOCK);
         return -errno;
     }
 
-    return 0;
+    ret = unlock_on_server(path, RW_READ_LOCK);
+    if (ret < 0) DLOG("Unable to unlock it on server: %d\n", -ret);
+
+    return ret;
 }
 
-
-
+//////////////////////////////////////////////////////////////////////////////////////////
 
 int getattr_from_server(const char *path, struct stat *statbuf) {
     DLOG("download getattr called for '%s'", path);
@@ -227,6 +239,70 @@ int read_from_server(const char *path, char *buf, size_t size, struct fuse_file_
         else fxn_ret += *ret;
     }
     catch (...) {}
+
+    delete []args;
+
+    return fxn_ret;
+}
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////
+
+int lock_on_server(const char *path, rw_lock_mode_t mode) {
+    DLOG("lock called for '%s'", path);
+
+    int ARG_COUNT = 3;
+    void **args = new void*[ARG_COUNT];
+    int arg_types[ARG_COUNT + 1];
+
+    int pathlen = strlen(path) + 1;
+    arg_types[0] = argTypeFrmtr(yes, no, yes, ARG_CHAR, (uint) pathlen); //path
+    args[0] = (void *)path;
+
+    arg_types[1] = argTypeFrmtr(yes, no, no, ARG_INT); //mode
+    args[1] = (void *)(&mode);
+
+    RAII<int> ret(0);
+    arg_types[2] = argTypeFrmtr(no, yes, no, ARG_INT); //retcode
+    args[2] = (void *)ret.ptr;
+
+    arg_types[3] = 0;
+
+    int rpc_ret = rpcCall((char *)"lock", arg_types, args);
+
+    int fxn_ret = 0;
+    if (rpc_ret < 0) { DLOG("lock rpc failed with error '%d'", rpc_ret); fxn_ret = -EINVAL; }
+    else fxn_ret = *ret;
+
+    delete []args;
+
+    return fxn_ret;
+}
+
+int unlock_on_server(const char *path, rw_lock_mode_t mode) {
+    DLOG("unlock called for '%s'", path);
+
+    int ARG_COUNT = 3;
+    void **args = new void*[ARG_COUNT];
+    int arg_types[ARG_COUNT + 1];
+
+    int pathlen = strlen(path) + 1;
+    arg_types[0] = argTypeFrmtr(yes, no, yes, ARG_CHAR, (uint) pathlen); //path
+    args[0] = (void *)path;
+
+    arg_types[1] = argTypeFrmtr(yes, no, no, ARG_INT); //mode
+    args[1] = (void *)(&mode);
+
+    RAII<int> ret(0);
+    arg_types[2] = argTypeFrmtr(no, yes, no, ARG_INT); //retcode
+    args[2] = (void *)ret.ptr;
+
+    arg_types[3] = 0;
+
+    int rpc_ret = rpcCall((char *)"unlock", arg_types, args);
+
+    int fxn_ret = 0;
+    if (rpc_ret < 0) { DLOG("unlock rpc failed with error '%d'", rpc_ret); fxn_ret = -EINVAL; }
+    else fxn_ret = *ret;
 
     delete []args;
 

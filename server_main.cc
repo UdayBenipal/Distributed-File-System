@@ -1,5 +1,6 @@
 #include "rpc.h"
 #include "watdfs_server.h"
+#include "lock_server.h"
 #include "debug.h"
 
 # ifdef PRINT_ERR
@@ -33,6 +34,9 @@ int main(int argc, char *argv[]) {
     // register functions with the RPC library
     ret = rpc_watdfs_server_register();
     if (ret < 0) { DLOG("WATDFS SERVER FUNCTIONS COULD NOT BE REGISTERED FOR RPC"); return ret; }
+
+    ret = rpc_lock_server_register();
+    if (ret < 0) { DLOG("LOCK SERVER FUNCTIONS COULD NOT BE REGISTERED FOR RPC"); return ret; }
 
     ret = rpcExecute();
     if (ret < 0) { DLOG("RPC EXECUTE FAILED"); return ret; }

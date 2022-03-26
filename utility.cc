@@ -1,5 +1,6 @@
 #include <assert.h>
 #include <cstring>
+#include <fcntl.h>
 #include "rpc.h"
 #include "utility.h"
 
@@ -21,6 +22,64 @@ const char* FileUtil::getAbsolutePath(const char* file_path) {
     strcat(full_path, file_path);
 
     return full_path;
+}
+
+
+bool FileUtil::openForWrite(const char* file) {
+    std::string key(file);
+
+    mtx.lock();
+
+    AccessType accessType = NONE;
+    if (map.find(key) != map.end()) accessType = map.at(key);
+
+    mtx.unlock();
+
+    return accessType==WRITE;
+}
+
+bool FileUtil::isOpen(const char* file) {
+    std::string key(file);
+
+    mtx.lock();
+
+    bool isOpen = (map.find(key) != map.end());
+
+    mtx.unlock();
+
+    return isOpen;
+}
+
+void FileUtil::updateAccessType(const char *file, AccessType accessType) {
+    assert(accessType != NONE);
+
+    std::string key(file);
+
+    mtx.lock();
+
+    map[key] = accessType;
+
+    mtx.unlock();
+}
+
+void FileUtil::removeFile(const char *file) {
+    std::string key(file);
+
+    mtx.lock();
+
+    map.erase(key);
+
+    mtx.unlock();
+}
+
+
+AccessType processAccessType(int flags) {
+
+    int mode = flags & O_ACCMODE;
+    
+    if (mode == O_RDONLY) return READ;
+
+    return WRITE;
 }
 
 

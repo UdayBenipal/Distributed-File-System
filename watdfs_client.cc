@@ -30,6 +30,7 @@ void *watdfs_cli_init(struct fuse_conn_info *conn, const char *path_to_cache,
     }
 
     fileUtil.setDir(path_to_cache);
+    fileUtil.cacheInterval = cache_interval;
 
     // TODO Initialize any global state that you require for the assignment and return it.
     // The value that you return here will be passed as userdata in other functions.
@@ -63,50 +64,53 @@ int watdfs_cli_getattr(void *userdata, const char *path, struct stat *statbuf) {
     // SET UP THE RPC CALL
     DLOG("watdfs_cli_getattr called for '%s'", path);
     
-    int ARG_COUNT = 3; // getattr has 3 arguments
-    void **args = new void*[ARG_COUNT]; // Allocate space for the output arguments
-    int arg_types[ARG_COUNT + 1]; // Allocate the space for arg types
+    int ret = 0;
 
-    int pathlen = strlen(path) + 1;
-    arg_types[0] = argTypeFrmtr(yes, no, yes, ARG_CHAR, (uint) pathlen); //path
-    args[0] = (void *)path;
+    FileData* clientFileData = fileUtil.getClientFileData(path);
+    const bool isOpen = (clientFileData != nullptr);
 
-    arg_types[1] = argTypeFrmtr(no, yes, yes, ARG_CHAR, (uint) sizeof(struct stat)); //statbuf
-    args[1] = (void *)statbuf;
+    struct fuse_file_info *fi = nullptr;
+    if (!isOpen) {
+        fi = (struct fuse_file_info *)malloc(sizeof(struct fuse_file_info *));
+        fi->flags = O_RDONLY;
+    } else fi = clientFileData->fi;
 
-    int *ret = (int *)malloc(sizeof(int)); *ret = 0;
-    arg_types[2] = argTypeFrmtr(no, yes, no, ARG_INT); //retcode
-    args[2] = (void *)ret;
+    AccessType accessType = processAccessType(fi->flags);
+    if (!isOpen || (READ == accessType && !isFresh(fileUtil, path, fi))) {
+        ret = download_file(fileUtil, path, fi);
+        DLOG("download done");
+        if (ret < 0) {
+            DLOG("getattr: download failed");
+            return -1; //TODO: better error
+        }
+        if (!isOpen) {
+            clientFileData = fileUtil.getClientFileData(path);
+            if (clientFileData == nullptr) {
+                DLOG("getattr: cannot find file in cache after download");
+                return -1; //TODO: better error
+            }
+        }
+    } else DLOG("getattr: its fresh");
 
-    arg_types[3] = 0;
+    int fd_client = clientFileData->fh;
+    DLOG("File Descriptor: %d\n", fd_client);
 
-    // MAKE THE RPC CALL
-    int rpc_ret = rpcCall((char *)"getattr", arg_types, args);
-
-    int fxn_ret = 0;
-    if (rpc_ret < 0) {
-        DLOG("getattr rpc failed with error '%d'", rpc_ret);
-        // Something went wrong with the rpcCall, return a sensible return
-        // value. In this case lets return, -EINVAL
-        fxn_ret = -EINVAL;
-    } else {
-        // Our RPC call succeeded. However, it's possible that the return code
-        // from the server is not 0, that is it may be -errno. Therefore, we
-        // should set our function return value to the retcode from the server.
-        fxn_ret = *ret;
+    ret = fstat(fd_client, statbuf);
+    if (ret < 0) {
+        DLOG("Failed to get the attributes due to error: %d\n", errno);
+        memset(statbuf, 0, sizeof(struct stat));
+        return -errno;
     }
 
-    // If the return code of watdfs_cli_getattr is negative (an error), then 
-    // we need to make sure that the stat structure is filled with 0s. Otherwise,
-    // FUSE will be confused by the contradicting return values.
-    if (fxn_ret < 0) memset(statbuf, 0, sizeof(struct stat));
-
-    // Clean up the memory we have allocated.
-    free(ret);
-    delete []args;
-
-    // Finally return the value we got from the server.
-    return fxn_ret;
+    if (!isOpen) {
+        ret = upload_file(fileUtil, path, fi, true);
+        if (ret < 0) {
+            DLOG("getAttr: upload failed");
+            return -1; //TODO: better error
+        }
+        free(fi);
+    }
+    return 0;
 }
 
 // CREATE, OPEN AND CLOSE
@@ -127,9 +131,9 @@ int watdfs_cli_mknod(void *userdata, const char *path, mode_t mode, dev_t dev) {
     arg_types[2] = argTypeFrmtr(yes, no, no, ARG_LONG); //dev
     args[2] = (void *)(&dev);
 
-    int *ret = (int *)malloc(sizeof(int)); *ret = 0;
+    RAII<int> ret(0);
     arg_types[3] = argTypeFrmtr(no, yes, no, ARG_INT); //retcode
-    args[3] = (void *)ret;
+    args[3] = (void *)ret.ptr;
 
     arg_types[4] = 0;
 
@@ -139,8 +143,11 @@ int watdfs_cli_mknod(void *userdata, const char *path, mode_t mode, dev_t dev) {
     if (rpc_ret < 0) { DLOG("mknod rpc failed with error '%d'", rpc_ret); fxn_ret = -EINVAL; }
     else fxn_ret = *ret;
 
-    free(ret);
     delete []args;
+
+    const char* full_path = fileUtil.getAbsolutePath(path);
+    int sys_ret = mknod(full_path, mode, dev);
+    if (sys_ret < 0) { DLOG("mknod failed for cache with error: %d", errno); fxn_ret = -errno; }
 
     return fxn_ret;
 }
@@ -148,18 +155,11 @@ int watdfs_cli_mknod(void *userdata, const char *path, mode_t mode, dev_t dev) {
 int watdfs_cli_open(void *userdata, const char *path, struct fuse_file_info *fi) {
     DLOG("watdfs_cli_open called for '%s'", path);
 
-    if (fileUtil.isOpen(path)) {
-        DLOG("File already opended");
-        return -EMFILE;
-    }
+    const bool isOpen = (fileUtil.getClientFileData(path) != nullptr);
+    if (isOpen) { DLOG("File is already open"); return -EMFILE; }
 
     int ret = 0;
     ret = download_file(fileUtil, path, fi);
-
-    if (ret==0) {
-        AccessType accessType = processAccessType(fi->flags);
-        fileUtil.updateAccessType(path, accessType);
-    }
 
     return ret;
 }
@@ -167,36 +167,10 @@ int watdfs_cli_open(void *userdata, const char *path, struct fuse_file_info *fi)
 int watdfs_cli_release(void *userdata, const char *path, struct fuse_file_info *fi) {
     DLOG("watdfs_cli_release called for '%s'", path);
 
-    int ARG_COUNT = 3;
-    void **args = new void*[ARG_COUNT];
-    int arg_types[ARG_COUNT + 1];
+    int ret = 0;
+    ret = upload_file(fileUtil, path, fi, true);
 
-    int pathlen = strlen(path) + 1;
-    arg_types[0] = argTypeFrmtr(yes, no, yes, ARG_CHAR, (uint) pathlen); //path
-    args[0] = (void *)path;
-
-    arg_types[1] = argTypeFrmtr(yes, no, yes, ARG_CHAR, (uint) sizeof(struct fuse_file_info)); //fi
-    args[1] = (void *)(fi);
-
-    int *ret = (int *)malloc(sizeof(int)); *ret = 0;
-    arg_types[2] = argTypeFrmtr(no, yes, no, ARG_INT); //retcode
-    args[2] = (void *)ret;
-
-    arg_types[3] = 0;
-
-    int rpc_ret = rpcCall((char *)"release", arg_types, args);
-
-    int fxn_ret = 0;
-    if (rpc_ret < 0) { DLOG("release rpc failed with error '%d'", rpc_ret); fxn_ret = -EINVAL; }
-    else {
-        fileUtil.removeFile(path);
-        fxn_ret = *ret;
-    }
-
-    free(ret);
-    delete []args;
-
-    return fxn_ret;
+    return ret;
 }
 
 // READ AND WRITE DATA
@@ -204,130 +178,65 @@ int watdfs_cli_read(void *userdata, const char *path, char *buf, size_t size,
                     off_t offset, struct fuse_file_info *fi) {
     DLOG("watdfs_cli_read called for '%s'", path);
 
-    int ARG_COUNT = 6;
-    void **args = new void*[ARG_COUNT];
-    int arg_types[ARG_COUNT + 1];
+    int ret = 0;
 
-    int pathlen = strlen(path) + 1;
-    arg_types[0] = argTypeFrmtr(yes, no, yes, ARG_CHAR, (uint) pathlen); //path
-    args[0] = (void *)path;
-
-    arg_types[1] = argTypeFrmtr(no, yes, yes, ARG_CHAR, MAX_ARRAY_LEN); //buf
-    args[1] = (void *)buf;
-
-    size_t *m_size = (size_t *)malloc(sizeof(size_t)); *m_size = MAX_ARRAY_LEN;
-    arg_types[2] = argTypeFrmtr(yes, no, no, ARG_LONG); //size
-    args[2] = (void *)m_size;
-
-    arg_types[3] = argTypeFrmtr(yes, no, no, ARG_LONG); //offset
-    args[3] = (void *)&offset;
-
-    arg_types[4] = argTypeFrmtr(yes, no, yes, ARG_CHAR, (uint) sizeof(struct fuse_file_info)); //fi
-    args[4] = (void *)(fi);
-
-    int *ret = (int *)malloc(sizeof(int)); *ret = 0;
-    arg_types[5] = argTypeFrmtr(no, yes, no, ARG_INT); //retcode
-    args[5] = (void *)ret;
-    
-    arg_types[6] = 0; // the null terminator
-
-    // Remember that size may be greater then the maximum array size of the RPC library
-    long fxn_ret = 0;
-    try {
-
-        while (size > MAX_ARRAY_LEN) {
-            int rpc_ret = rpcCall((char *)"read", arg_types, args);
-            if (rpc_ret < 0) { DLOG("read rpc failed with error '%d'", rpc_ret); fxn_ret = -EINVAL; throw 1;}
-            else if (*ret < 0) { fxn_ret = *ret; throw 1; } //trouble in reading at server
-            else fxn_ret += *ret;
-
-            if (*ret < MAX_ARRAY_LEN) throw 1; //EOF
-
-            size -= MAX_ARRAY_LEN;
-            offset += MAX_ARRAY_LEN;
-            args[1] = (void *)(buf+MAX_ARRAY_LEN);
+    AccessType accessType = processAccessType(fi->flags);
+    if (READ == accessType && !isFresh(fileUtil, path, fi)) {
+        ret = download_file(fileUtil, path, fi);
+        if (ret < 0) {
+            DLOG("read: download failed");
+            return -1; //TODO: better error
         }
+    } else DLOG("read: its fresh");
 
-        arg_types[1] = argTypeFrmtr(no, yes, yes, ARG_CHAR, size); //buf
-        *m_size = size;
-
-        int rpc_ret = rpcCall((char *)"read", arg_types, args);
-        if (rpc_ret < 0) { DLOG("read rpc failed with error '%d'", rpc_ret); fxn_ret = -EINVAL; }
-        else if (*ret < 0) fxn_ret = *ret;
-        else fxn_ret += *ret;
+    FileData* clientFileData = fileUtil.getClientFileData(path);
+    if (clientFileData == nullptr) {
+        DLOG("read: cannot find file in cache even after download");
+        return -1; //TODO: better error
     }
-    catch (...) {}
+    int fd_client = clientFileData->fh;
+    DLOG("File Descriptor: %d\n", fd_client);
 
-    free(ret);
-    free(m_size);
-    delete []args;
+    //read from file on cache
+    ret = pread(fd_client, buf, size, offset);
+    if (ret < 0) {
+        DLOG("read: failed to read from cache due to error: %d\n", errno);
+        return -errno;
+    }
 
-    return fxn_ret;
+    return ret;
 }
 
 int watdfs_cli_write(void *userdata, const char *path, const char *buf,
                      size_t size, off_t offset, struct fuse_file_info *fi) {
     DLOG("watdfs_cli_write called for '%s'", path);
 
-    int ARG_COUNT = 6;
-    void **args = new void*[ARG_COUNT];
-    int arg_types[ARG_COUNT + 1];
+    int ret = 0;
 
-    int pathlen = strlen(path) + 1;
-    arg_types[0] = argTypeFrmtr(yes, no, yes, ARG_CHAR, (uint) pathlen); //path
-    args[0] = (void *)path;
-
-    arg_types[1] = argTypeFrmtr(yes, no, yes, ARG_CHAR, MAX_ARRAY_LEN); //buf
-    args[1] = (void *)buf;
-
-    size_t *m_size = (size_t *)malloc(sizeof(size_t)); *m_size = MAX_ARRAY_LEN;
-    arg_types[2] = argTypeFrmtr(yes, no, no, ARG_LONG); //size
-    args[2] = (void *)m_size;
-
-    arg_types[3] = argTypeFrmtr(yes, no, no, ARG_LONG); //offset
-    args[3] = (void *)&offset;
-
-    arg_types[4] = argTypeFrmtr(yes, no, yes, ARG_CHAR, (uint) sizeof(struct fuse_file_info)); //fi
-    args[4] = (void *)(fi);
-
-    int *ret = (int *)malloc(sizeof(int)); *ret = 0;
-    arg_types[5] = argTypeFrmtr(no, yes, no, ARG_INT); //retcode
-    args[5] = (void *)ret;
-    
-    arg_types[6] = 0; // the null terminator
-
-    // Remember that size may be greater then the maximum array size of the RPC library
-    long fxn_ret = 0;
-    try {
-
-        while (size > MAX_ARRAY_LEN) {
-            int rpc_ret = rpcCall((char *)"write", arg_types, args);
-            if (rpc_ret < 0) { DLOG("write rpc failed with error '%d'", rpc_ret); fxn_ret = -EINVAL; throw 1;}
-            else if (*ret < 0) { fxn_ret = *ret; throw 1; } //trouble in writing at server
-            else fxn_ret += *ret;
-
-            if (*ret < MAX_ARRAY_LEN) throw 1; //EOF
-
-            size -= MAX_ARRAY_LEN;
-            offset += MAX_ARRAY_LEN;
-            args[1] = (void *)(buf+MAX_ARRAY_LEN);
-        }
-
-        arg_types[1] = argTypeFrmtr(yes, no, yes, ARG_CHAR, size); //buf
-        *m_size = size;
-
-        int rpc_ret = rpcCall((char *)"write", arg_types, args);
-        if (rpc_ret < 0) { DLOG("write rpc failed with error '%d'", rpc_ret); fxn_ret = -EINVAL; }
-        else if (*ret < 0) fxn_ret = *ret;
-        else fxn_ret += *ret;
+    FileData* clientFileData = fileUtil.getClientFileData(path);
+    if (clientFileData == nullptr) {
+        DLOG("write: cannot find file in cache even after download");
+        return -1; //TODO: better error
     }
-    catch (...) {}
+    int fd_client = clientFileData->fh;
+    DLOG("File Descriptor: %d\n", fd_client);
 
-    free(ret);
-    free(m_size);
-    delete []args;
+    //write to file on cache
+    ret = pwrite(fd_client, buf, size, offset);
+    if (ret < 0) {
+        DLOG("write: failed to write to cache due to error: %d\n", errno);
+        return -errno;
+    }
 
-    return fxn_ret;
+    if (!isFresh(fileUtil, path, fi)) {
+        ret = upload_file(fileUtil, path, fi);
+        if (ret < 0) {
+            DLOG("write: upload failed");
+            return -1; //TODO: better error
+        }
+    } else DLOG("write: its fresh");
+
+    return ret;
 }
 
 int watdfs_cli_truncate(void *userdata, const char *path, off_t newsize) {
@@ -366,33 +275,15 @@ int watdfs_cli_fsync(void *userdata, const char *path,
                      struct fuse_file_info *fi) {
     DLOG("watdfs_cli_fsync called for '%s'", path);
 
-    int ARG_COUNT = 3;
-    void **args = new void*[ARG_COUNT];
-    int arg_types[ARG_COUNT + 1];
+    AccessType accessType = processAccessType(fi->flags);
+    if (accessType != READ) {
+        DLOG("fsync called on read only file");
+        return -1;
+    }
 
-    int pathlen = strlen(path) + 1;
-    arg_types[0] = argTypeFrmtr(yes, no, yes, ARG_CHAR, (uint) pathlen); //path
-    args[0] = (void *)path;
-
-    arg_types[1] = argTypeFrmtr(yes, no, yes, ARG_CHAR, (uint) sizeof(struct fuse_file_info)); //fi
-    args[1] = (void *)(fi);
-
-    int *ret = (int *)malloc(sizeof(int)); *ret = 0;
-    arg_types[2] = argTypeFrmtr(no, yes, no, ARG_INT); //retcode
-    args[2] = (void *)ret;
-
-    arg_types[3] = 0;
-
-    int rpc_ret = rpcCall((char *)"fsync", arg_types, args);
-
-    int fxn_ret = 0;
-    if (rpc_ret < 0) { DLOG("fsync rpc failed with error '%d'", rpc_ret); fxn_ret = -EINVAL; }
-    else fxn_ret = *ret;
-
-    free(ret);
-    delete []args;
-
-    return fxn_ret;
+    int ret = 0;
+    ret = upload_file(fileUtil, path, fi);
+    return ret;
 }
 
 // CHANGE METADATA

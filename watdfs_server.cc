@@ -27,7 +27,7 @@ void set_server_persist_dir(char *dir) { fileUtil.setDir(dir); }
 
 int watdfs_getattr(int *argTypes, void **args) {
     const char* short_path = (const char*)args[0]; //the path relative to the mountpoint
-    RAII<const char> full_path(fileUtil.getAbsolutePath(short_path));
+    const char* full_path = fileUtil.getAbsolutePath(short_path);
 
     struct stat *statbuf = (struct stat *)args[1]; //stat structure
 
@@ -35,7 +35,7 @@ int watdfs_getattr(int *argTypes, void **args) {
     *ret = 0; // initially set the return code to be 0.
 
     int sys_ret = 0; // sys_ret the return code from the stat system call
-    sys_ret = stat(full_path.ptr, statbuf);
+    sys_ret = stat(full_path, statbuf);
     if (sys_ret < 0) *ret = -errno;
 
     DLOG("Returning code: %d", *ret);
@@ -58,7 +58,7 @@ void watdfs_getattr_register() {
 
 int watdfs_mknod(int *argTypes, void **args) {
     const char* short_path = (const char*)args[0];
-    RAII<const char> full_path(fileUtil.getAbsolutePath(short_path));
+    const char* full_path = fileUtil.getAbsolutePath(short_path);
 
     mode_t* mode = (mode_t *)args[1];
 
@@ -68,7 +68,7 @@ int watdfs_mknod(int *argTypes, void **args) {
     *ret = 0;
 
     int sys_ret = 0;
-    sys_ret = mknod(full_path.ptr, *mode, *dev);
+    sys_ret = mknod(full_path, *mode, *dev);
     if (sys_ret < 0) *ret = -errno;
 
     DLOG("Returning code: %d", *ret);
@@ -92,7 +92,7 @@ void watdfs_mknod_register() {
 
 int watdfs_open(int *argTypes, void **args) {
     const char* short_path = (const char*)args[0];
-    RAII<const char> full_path(fileUtil.getAbsolutePath(short_path));
+    const char* full_path = fileUtil.getAbsolutePath(short_path);
 
     struct fuse_file_info *fi = (struct fuse_file_info *)args[1];
 
@@ -100,19 +100,19 @@ int watdfs_open(int *argTypes, void **args) {
     *ret = 0;
 
     AccessType accessType = processAccessType(fi->flags);
-    if (accessType == WRITE && fileUtil.openForWrite(short_path)) {
+    if (accessType == WRITE && fileUtil.serverFilePresent(short_path)) {
         *ret = -EACCES;
         DLOG("File already opended in write mode: %d", *ret);
         return 0;
     }
 
     int sys_ret = 0;
-    sys_ret = open(full_path.ptr, fi->flags);
+    sys_ret = open(full_path, fi->flags);
     if (sys_ret < 0) {
         *ret = -errno;
     } else {
         fi->fh = sys_ret;
-        fileUtil.updateAccessType(short_path, accessType);
+        if(accessType == WRITE) fileUtil.addServerFile(short_path);
     }
 
     DLOG("Returning code: %d", *ret);
@@ -146,10 +146,7 @@ int watdfs_release(int *argTypes, void **args) {
     if (sys_ret < 0) {
         *ret = -errno;
     } else {
-        fi->fh = sys_ret;
-        if (fileUtil.openForWrite(short_path)) {
-            fileUtil.removeFile(short_path);
-        }
+        fileUtil.removeFile(short_path);
     }
 
     DLOG("Returning code: %d", *ret);
@@ -244,7 +241,7 @@ void watdfs_write_register() {
 
 int watdfs_truncate(int *argTypes, void **args) {
     const char* short_path = (const char*)args[0];
-    RAII<const char> full_path(fileUtil.getAbsolutePath(short_path));
+    const char* full_path = fileUtil.getAbsolutePath(short_path);
 
     off_t *newsize = (off_t *)args[1];
 
@@ -252,7 +249,7 @@ int watdfs_truncate(int *argTypes, void **args) {
     *ret = 0;
 
     int sys_ret = 0;
-    sys_ret = truncate(full_path.ptr, *newsize);
+    sys_ret = truncate(full_path, *newsize);
     if (sys_ret < 0) *ret = -errno;
 
     DLOG("Returning code: %d", *ret);
@@ -303,7 +300,7 @@ void watdfs_fsync_register() {
 
 int watdfs_utimens(int *argTypes, void **args) {
     const char* short_path = (const char*)args[0];
-    RAII<const char> full_path(fileUtil.getAbsolutePath(short_path));
+    const char* full_path = fileUtil.getAbsolutePath(short_path);
 
     struct timespec *ts = (struct timespec *)args[1];
 
@@ -311,7 +308,7 @@ int watdfs_utimens(int *argTypes, void **args) {
     *ret = 0;
 
     int sys_ret = 0;
-    sys_ret = utimensat(-1, full_path.ptr, ts, 0);
+    sys_ret = utimensat(-1, full_path, ts, 0);
     if (sys_ret < 0) *ret = -errno;
 
     DLOG("Returning code: %d", *ret);

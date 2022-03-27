@@ -44,18 +44,6 @@ int download_file(FileUtil& fileUtil, const char *path, struct fuse_file_info *f
         return ret;
     }
 
-    // open file on server based on provided flags
-    // fi->fh will have server file descriptor
-    if (!isOpen) {
-        ret = open_on_server(path, fi);
-        if (ret < 0) {
-            DLOG("Failed to open/create file on server due to error: %d\n", -ret);
-            unlock_on_server(path, RW_READ_LOCK);
-            return ret;
-        }
-        DLOG("File Descriptor On Server: %ld\n", fi->fh);
-    }
-
     // getattr of file from server
     RAII<struct stat> statbuf;
     statbuf->st_size = 0; //set it to 0 before making the call
@@ -67,8 +55,23 @@ int download_file(FileUtil& fileUtil, const char *path, struct fuse_file_info *f
     }
     DLOG("Size: %ld\n", statbuf->st_size);
 
+    // open file on server based on provided flags
+    // fi->fh will have server file descriptor
+    if (!isOpen) {
+        int temp_flags = fi->flags;
+        if((fi->flags&O_ACCMODE) == O_WRONLY) fi->flags = O_RDWR;
+        ret = open_on_server(path, fi);
+        if (ret < 0) {
+            DLOG("Failed to open/create file on server due to error: %d\n", -ret);
+            unlock_on_server(path, RW_READ_LOCK);
+            return ret;
+        }
+        fi->flags = temp_flags;
+        DLOG("File Descriptor On Server: %ld\n", fi->fh);
+    }
+
     // open/create file in client cache, truncate if it already exists
-    ret = open(full_path, O_CREAT|O_RDWR|O_TRUNC);
+    ret = open(full_path, O_CREAT|O_RDWR|O_TRUNC, statbuf->st_mode);
     if (ret < 0) {
         DLOG("Unable to create/open file in client cache due to error: %d\n", errno);
         unlock_on_server(path, RW_READ_LOCK);
@@ -98,15 +101,6 @@ int download_file(FileUtil& fileUtil, const char *path, struct fuse_file_info *f
             return -errno;
         }
         delete []buf;
-    }
-
-    if(!isOpen) {
-        ret = fchmod(temp_fd_client, statbuf->st_mode);
-        if (ret < 0) {
-            DLOG("Unable to update file permission metadata in client cache due to error: %d\n", errno);
-            unlock_on_server(path, RW_READ_LOCK);
-            return -errno;
-        }
     }
 
     //close on client
@@ -152,17 +146,32 @@ int download_file(FileUtil& fileUtil, const char *path, struct fuse_file_info *f
 
 int upload_file(FileUtil& fileUtil, const char *path,
                 struct fuse_file_info *fi, bool closeFiles) {
-    DLOG("upload called for '%s'", path);
+    const char* full_path = fileUtil.getAbsolutePath(path);
+    DLOG("Upload file: %s\n", full_path);
 
     int ret = 0;
 
     FileData* clientFileData = fileUtil.getClientFileData(path);
     if (clientFileData == nullptr) {
-        DLOG("Unable to find the file in cache");
-        return -1; //TODO: Find a appropriate error code
+        DLOG("cannot find file in cache");
+        return -1; //TODO: better error
     }
     int fd_client = clientFileData->fh;
     DLOG("File Descriptor: %d\n", fd_client);
+
+    ret = fsync(fd_client);
+    if (ret < 0) {
+        DLOG("fsync failed on the client due to error: %d", errno);
+        return -errno;
+    }
+
+    ret = open(full_path, O_RDWR);
+    if (ret < 0) {
+        DLOG("Unable to open file in client cache due to error: %d\n", errno);
+        return -errno;
+    }
+    int temp_fd_client = ret;
+    DLOG("Temp File Descriptor: %d\n", temp_fd_client);
 
     ret = lock_on_server(path, RW_WRITE_LOCK);
     if (ret < 0) {
@@ -175,7 +184,7 @@ int upload_file(FileUtil& fileUtil, const char *path,
         // getattr of file from cache
         RAII<struct stat> statbuf;
         statbuf->st_size = 0; //set it to 0 before making the call
-        ret = fstat(fd_client, statbuf.ptr);
+        ret = fstat(temp_fd_client, statbuf.ptr);
         if (ret < 0) {
             DLOG("Failed to get the attributes due to error: %d\n", errno);
             unlock_on_server(path, RW_WRITE_LOCK);
@@ -192,8 +201,9 @@ int upload_file(FileUtil& fileUtil, const char *path,
 
         if (statbuf->st_size > 0) { //read and write if file is not empty
             char *buf = new char[statbuf->st_size];
+
             //read file from cache
-            ret = read(fd_client, buf, statbuf->st_size);
+            ret = read(temp_fd_client, buf, statbuf->st_size);
             if (ret < 0) {
                 DLOG("Failed to read from cache due to error: %d\n", errno);
                 delete []buf;
@@ -220,6 +230,16 @@ int upload_file(FileUtil& fileUtil, const char *path,
             unlock_on_server(path, RW_WRITE_LOCK);
             return ret;
         }
+
+        fileUtil.updateTc(path);
+    }
+
+    //close on tmp file on client
+    ret = close(temp_fd_client);
+    if (ret < 0) {
+        DLOG("Unable to close tmp file due to error: %d\n", errno);
+        unlock_on_server(path, RW_WRITE_LOCK);
+        return -errno;
     }
 
     if (closeFiles) {
@@ -241,8 +261,6 @@ int upload_file(FileUtil& fileUtil, const char *path,
 
         fileUtil.removeFile(path);
     }
-
-    fileUtil.updateTc(path);
 
     ret = unlock_on_server(path, RW_WRITE_LOCK);
     if (ret < 0) DLOG("Unable to unlock it on server: %d\n", -ret);

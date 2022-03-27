@@ -243,41 +243,57 @@ int watdfs_cli_write(void *userdata, const char *path, const char *buf,
 int watdfs_cli_truncate(void *userdata, const char *path, off_t newsize) {
     DLOG("watdfs_cli_truncate called for '%s'", path);
 
-    int ARG_COUNT = 3;
-    void **args = new void*[ARG_COUNT];
-    int arg_types[ARG_COUNT + 1];
+    FileData* clientFileData = fileUtil.getClientFileData(path);
+    const bool isOpen = (clientFileData != nullptr);
+    AccessType accessType = NONE;
+    if(isOpen) accessType = processAccessType(clientFileData->flags);
 
-    int pathlen = strlen(path) + 1;
-    arg_types[0] = argTypeFrmtr(yes, no, yes, ARG_CHAR, (uint) pathlen); //path
-    args[0] = (void *)path;
+    RAII<struct fuse_file_info> fi;
 
-    arg_types[1] = argTypeFrmtr(yes, no, no, ARG_LONG); //newsize
-    args[1] = (void *)(&newsize);
+    if (!isOpen) {
+        fi->flags = O_RDWR;
+        download_file(fileUtil, path, fi.ptr);
+        clientFileData = fileUtil.getClientFileData(path);
+        if (clientFileData == nullptr) {
+            DLOG("truncate: cannot find file in cache after download");
+            return -1; //TODO: better error
+        }
+    } else if (READ==accessType) { DLOG("File is open in read mode"); return -EMFILE; }
 
-    int *ret = (int *)malloc(sizeof(int)); *ret = 0;
-    arg_types[2] = argTypeFrmtr(no, yes, no, ARG_INT); //retcode
-    args[2] = (void *)ret;
+    int fd_client = clientFileData->fh;
+    DLOG("File Descriptor: %d\n", fd_client);
 
-    arg_types[3] = 0;
+    int ret = 0;
+    ret = ftruncate(fd_client, newsize);
+    if (ret < 0) {
+        DLOG("truncate failed on cache file with error: %d\n", errno);
+        return -errno;
+    }
 
-    int rpc_ret = rpcCall((char *)"truncate", arg_types, args);
+    if (!isOpen || !isFresh(fileUtil, path, fi.ptr)) {
+        ret = upload_file(fileUtil, path, fi.ptr, !isOpen);
+        if (ret < 0) {
+            DLOG("truncate: upload failed");
+            return -1; //TODO: better error
+        }
+    }
 
-    int fxn_ret = 0;
-    if (rpc_ret < 0) { DLOG("truncate rpc failed with error '%d'", rpc_ret); fxn_ret = -EINVAL; }
-    else fxn_ret = *ret;
-
-    free(ret);
-    delete []args;
-
-    return fxn_ret;
+    return 0;
 }
 
 int watdfs_cli_fsync(void *userdata, const char *path,
                      struct fuse_file_info *fi) {
     DLOG("watdfs_cli_fsync called for '%s'", path);
 
-    AccessType accessType = processAccessType(fi->flags);
-    if (accessType != READ) {
+    
+    FileData* clientFileData = fileUtil.getClientFileData(path);
+    if (clientFileData == nullptr) {
+        DLOG("fsync called on a closed file");
+        return -10;
+    }
+
+    AccessType accessType = processAccessType(clientFileData->flags);
+    if (accessType == READ) {
         DLOG("fsync called on read only file");
         return -1;
     }
@@ -289,33 +305,40 @@ int watdfs_cli_fsync(void *userdata, const char *path,
 
 // CHANGE METADATA
 int watdfs_cli_utimens(void *userdata, const char *path, const struct timespec ts[2]) {
-    DLOG("watdfs_cli_utimens called for '%s'", path);
+    FileData* clientFileData = fileUtil.getClientFileData(path);
+    const bool isOpen = (clientFileData != nullptr);
+    AccessType accessType = NONE;
+    if(isOpen) accessType = processAccessType(clientFileData->flags);
 
-    int ARG_COUNT = 3;
-    void **args = new void*[ARG_COUNT];
-    int arg_types[ARG_COUNT + 1];
+    RAII<struct fuse_file_info> fi;
 
-    int pathlen = strlen(path) + 1;
-    arg_types[0] = argTypeFrmtr(yes, no, yes, ARG_CHAR, (uint) pathlen); //path
-    args[0] = (void *)path;
+    if (!isOpen) {
+        fi->flags = O_RDWR;
+        download_file(fileUtil, path, fi.ptr);
+        clientFileData = fileUtil.getClientFileData(path);
+        if (clientFileData == nullptr) {
+            DLOG("utimens: cannot find file in cache after download");
+            return -1; //TODO: better error
+        }
+    } else if (READ==accessType) { DLOG("File is open in read mode"); return -EMFILE; }
 
-    arg_types[1] = argTypeFrmtr(yes, no, yes, ARG_CHAR, (uint) (sizeof(struct timespec)*2)); //ts
-    args[1] = (void *)(ts);
+    int fd_client = clientFileData->fh;
+    DLOG("File Descriptor: %d\n", fd_client);
 
-    int *ret = (int *)malloc(sizeof(int)); *ret = 0;
-    arg_types[2] = argTypeFrmtr(no, yes, no, ARG_INT); //retcode
-    args[2] = (void *)ret;
+    int ret = 0;
+    ret = futimens(fd_client, ts);
+    if (ret < 0) {
+        DLOG("utimens failed on cache file with error: %d\n", errno);
+        return -errno;
+    }
 
-    arg_types[3] = 0;
+    if (!isOpen || !isFresh(fileUtil, path, fi.ptr)) {
+        ret = upload_file(fileUtil, path, fi.ptr, !isOpen);
+        if (ret < 0) {
+            DLOG("utimens: upload failed");
+            return -1; //TODO: better error
+        }
+    }
 
-    int rpc_ret = rpcCall((char *)"utimens", arg_types, args);
-
-    int fxn_ret = 0;
-    if (rpc_ret < 0) { DLOG("utimens rpc failed with error '%d'", rpc_ret); fxn_ret = -EINVAL; }
-    else fxn_ret = *ret;
-
-    free(ret);
-    delete []args;
-
-    return fxn_ret;
+    return 0;
 }

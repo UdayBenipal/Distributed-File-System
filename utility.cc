@@ -7,8 +7,7 @@
 #include "debug.h"
 
 AccessType processAccessType(int flags) {
-    int mode = flags & O_ACCMODE;
-    if (mode == O_RDONLY) return READ;
+    if ((flags & O_ACCMODE) == O_RDONLY) return READ;
     return WRITE;
 }
 
@@ -78,21 +77,27 @@ FileData* FileUtil::getClientFileData(const char* file) {
 }
 
 void FileUtil::addServerFile(const char* file) {
+    DLOG("addServerFile for %s", file);
     std::string key(file);
+
     mtx.lock();
     set.emplace(key);
     mtx.unlock();
 }
 
 bool FileUtil::serverFilePresent(const char* file) {
+    DLOG("serverFilePresent for %s", file);
     std::string key(file);
+
     mtx.lock();
     bool isPresent = (set.find(key) != set.end());
     mtx.unlock();
+
     return isPresent;
 }
 
 void FileUtil::removeFile(const char *file) {
+    DLOG("removeFile for %s", file);
     std::string key(file);
 
     mtx.lock();

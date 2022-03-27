@@ -112,7 +112,7 @@ int watdfs_open(int *argTypes, void **args) {
         *ret = -errno;
     } else {
         fi->fh = sys_ret;
-        if(accessType == WRITE) fileUtil.addServerFile(short_path);
+        if (accessType == WRITE) fileUtil.addServerFile(short_path);
     }
 
     DLOG("Returning code: %d", *ret);
@@ -146,7 +146,8 @@ int watdfs_release(int *argTypes, void **args) {
     if (sys_ret < 0) {
         *ret = -errno;
     } else {
-        fileUtil.removeFile(short_path);
+        AccessType accessType = processAccessType(fi->flags);
+        if (accessType == WRITE) fileUtil.removeFile(short_path);
     }
 
     DLOG("Returning code: %d", *ret);

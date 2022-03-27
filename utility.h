@@ -20,10 +20,11 @@ template <class T> struct RAII {
 struct FileData {
     int fh;
     time_t tc;
-    struct fuse_file_info *fi;
+    int server_fh;
+    int flags;
 
-    FileData(int fh, time_t tc, struct fuse_file_info *fi): 
-        fh(fh), tc(tc), fi(fi) {}
+    FileData(int fh, time_t tc, int server_fh, int flags): 
+        fh(fh), tc(tc), server_fh(server_fh), flags(flags) {}
 };
 
 #define yes true
@@ -47,7 +48,7 @@ class FileUtil {
     void setDir(const char *curr_dir);
     const char* getAbsolutePath(const char* file_path);
 	
-    void addClientFileData(const char* file, int fh, struct fuse_file_info *fi);
+    void addClientFileData(const char* file, int fh, int server_fh, int flags);
     void updateTc(const char* file);
     FileData* getClientFileData(const char* file);
 

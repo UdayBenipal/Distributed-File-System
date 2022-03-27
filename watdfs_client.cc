@@ -69,24 +69,23 @@ int watdfs_cli_getattr(void *userdata, const char *path, struct stat *statbuf) {
     FileData* clientFileData = fileUtil.getClientFileData(path);
     const bool isOpen = (clientFileData != nullptr);
 
-    struct fuse_file_info *fi = nullptr;
-    if (!isOpen) {
-        fi = (struct fuse_file_info *)malloc(sizeof(struct fuse_file_info *));
-        fi->flags = O_RDONLY;
-    } else fi = clientFileData->fi;
+    RAII<struct fuse_file_info> fi;
+    if (isOpen) { fi->flags = clientFileData->flags; fi->fh = clientFileData->server_fh; }
+    else fi->flags = O_RDONLY;
 
     AccessType accessType = processAccessType(fi->flags);
-    if (!isOpen || (READ == accessType && !isFresh(fileUtil, path, fi))) {
-        ret = download_file(fileUtil, path, fi);
-        DLOG("download done");
+    if (!isOpen || (READ == accessType && !isFresh(fileUtil, path, fi.ptr))) {
+        ret = download_file(fileUtil, path, fi.ptr);
         if (ret < 0) {
             DLOG("getattr: download failed");
-            return -1; //TODO: better error
+            memset(statbuf, 0, sizeof(struct stat));
+            return ret;
         }
         if (!isOpen) {
             clientFileData = fileUtil.getClientFileData(path);
             if (clientFileData == nullptr) {
                 DLOG("getattr: cannot find file in cache after download");
+                memset(statbuf, 0, sizeof(struct stat));
                 return -1; //TODO: better error
             }
         }
@@ -103,12 +102,11 @@ int watdfs_cli_getattr(void *userdata, const char *path, struct stat *statbuf) {
     }
 
     if (!isOpen) {
-        ret = upload_file(fileUtil, path, fi, true);
+        ret = upload_file(fileUtil, path, fi.ptr, true);
         if (ret < 0) {
             DLOG("getAttr: upload failed");
             return -1; //TODO: better error
         }
-        free(fi);
     }
     return 0;
 }
@@ -197,6 +195,9 @@ int watdfs_cli_read(void *userdata, const char *path, char *buf, size_t size,
     int fd_client = clientFileData->fh;
     DLOG("File Descriptor: %d\n", fd_client);
 
+    // fd_client = open(fileUtil.getAbsolutePath(path), fi->flags);
+
+    DLOG("File Descriptor: %d\n", fd_client);
     //read from file on cache
     ret = pread(fd_client, buf, size, offset);
     if (ret < 0) {

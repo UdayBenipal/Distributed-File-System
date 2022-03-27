@@ -41,7 +41,7 @@ const char* FileUtil::getAbsolutePath(const char* file_path) {
     return full_path;
 }
 
-void FileUtil::addClientFileData(const char* file, int fh, struct fuse_file_info *fi) {
+void FileUtil::addClientFileData(const char* file, int fh, int server_fh, int flags) {
     DLOG("addClientFileData for %s", file);
     std::string key(file);
 
@@ -49,7 +49,7 @@ void FileUtil::addClientFileData(const char* file, int fh, struct fuse_file_info
     clock_gettime(CLOCK_REALTIME, &t);
 
     mtx.lock();
-    map[key] = new FileData(fh, t.tv_sec, fi);
+    map[key] = new FileData(fh, t.tv_sec, server_fh, flags);
     mtx.unlock();
 }
 

@@ -68,25 +68,14 @@ int download_file(FileUtil& fileUtil, const char *path, struct fuse_file_info *f
     DLOG("Size: %ld\n", statbuf->st_size);
 
     // open/create file in client cache, truncate if it already exists
-    int fd_client = -1;
-    if (!isOpen) {
-        ret = open(full_path, O_CREAT|O_WRONLY|O_TRUNC);
-        if (ret < 0) {
-            DLOG("Unable to create/open file in client cache due to error: %d\n", errno);
-            unlock_on_server(path, RW_READ_LOCK);
-            return -errno;
-        }
-        fd_client = ret;
-    } else {
-        fd_client = clientFileData->fh;
-        ret = ftruncate(fd_client, 0);
-        if (ret < 0) {
-            DLOG("Unable to truncate file in client cache due to error: %d\n", errno);
-            unlock_on_server(path, RW_READ_LOCK);
-            return -errno;
-        }
+    ret = open(full_path, O_CREAT|O_RDWR|O_TRUNC);
+    if (ret < 0) {
+        DLOG("Unable to create/open file in client cache due to error: %d\n", errno);
+        unlock_on_server(path, RW_READ_LOCK);
+        return -errno;
     }
-    DLOG("File Descriptor: %d\n", fd_client);
+    int temp_fd_client = ret;
+    DLOG("Temp File Descriptor: %d\n", temp_fd_client);
 
     if (statbuf->st_size > 0) { //read and write if file is not empty
         char *buf = new char[statbuf->st_size];
@@ -101,7 +90,7 @@ int download_file(FileUtil& fileUtil, const char *path, struct fuse_file_info *f
         DLOG("Buffer: %s\n", buf);
 
         //write the file in client cache
-        ret = write(fd_client, buf, statbuf->st_size);
+        ret = write(temp_fd_client, buf, statbuf->st_size);
         if (ret < 0) {
             DLOG("Unable to write in client cache due to error: %d\n", errno);
             delete []buf;
@@ -111,14 +100,40 @@ int download_file(FileUtil& fileUtil, const char *path, struct fuse_file_info *f
         delete []buf;
     }
 
-    //update file metadata in client cache
-    ret = fchmod(fd_client, statbuf->st_mode);
+    if(!isOpen) {
+        ret = fchmod(temp_fd_client, statbuf->st_mode);
+        if (ret < 0) {
+            DLOG("Unable to update file permission metadata in client cache due to error: %d\n", errno);
+            unlock_on_server(path, RW_READ_LOCK);
+            return -errno;
+        }
+    }
+
+    //close on client
+    ret = close(temp_fd_client);
     if (ret < 0) {
-        DLOG("Unable to update file permission metadata in client cache due to error: %d\n", errno);
+        DLOG("Unable to close in cache cache due to error: %d\n", errno);
         unlock_on_server(path, RW_READ_LOCK);
         return -errno;
     }
 
+    int fd_client = -1;
+    if(isOpen) {
+        fd_client = clientFileData->fh;
+        fileUtil.updateTc(path);
+    } else {
+        ret = open(full_path, fi->flags);
+        if (ret < 0) {
+            DLOG("Unable to open corresponding to given flags: %d\n", errno);
+            unlock_on_server(path, RW_READ_LOCK);
+            return -errno;
+        }
+        fd_client = ret;
+
+        fileUtil.addClientFileData(path, fd_client, fi->fh, fi->flags);
+    }
+
+    //update file metadata in client cache
     struct timespec times[] {statbuf->st_atim, statbuf->st_mtim};
     ret = futimens(fd_client, times);
     if (ret < 0) {
@@ -127,14 +142,11 @@ int download_file(FileUtil& fileUtil, const char *path, struct fuse_file_info *f
         return -errno;
     }
 
-    if(!isOpen) fileUtil.addClientFileData(path, fd_client, fi);
-    else fileUtil.updateTc(path);
-
     ret = unlock_on_server(path, RW_READ_LOCK);
     if (ret < 0) DLOG("Unable to unlock it on server: %d\n", -ret);
     DLOG("unblock done");
 
-    return ret;
+    return 0;
 }
 
 
@@ -246,7 +258,7 @@ bool isFresh(FileUtil& fileUtil, const char *path, struct fuse_file_info *fi) {
     FileData* clientFileData = fileUtil.getClientFileData(path);
     if (clientFileData == nullptr) {
         DLOG("isFresh: Unable to find the file in cache");
-        return -1; //TODO: Find a appropriate error code
+        return false; //TODO: Find a appropriate error code
     }
     int fd_client = clientFileData->fh;
     DLOG("File Descriptor: %d\n", fd_client);

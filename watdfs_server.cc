@@ -1,6 +1,7 @@
 #include "watdfs_server.h"
 #include "rpc.h"
 #include "utility.h"
+#include "lock_server.h"
 #include "debug.h"
 
 #include <sys/stat.h>

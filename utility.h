@@ -17,22 +17,23 @@ template <class T> struct RAII {
     ~RAII() { free((void *)ptr); }
 };
 
+enum AccessType { NONE, READ, WRITE };
+AccessType processAccessType(int flags);
+
 struct FileData {
     int fh;
-    time_t tc;
     int server_fh;
+    AccessType accessType;
     int flags;
+    time_t tc;
 
-    FileData(int fh, time_t tc, int server_fh, int flags): 
-        fh(fh), tc(tc), server_fh(server_fh), flags(flags) {}
+    FileData(int fh, int server_fh, AccessType accessType, int flags, time_t tc): 
+        fh(fh), server_fh(server_fh), accessType(accessType), flags(flags), tc(tc) {}
 };
 
 #define yes true
 #define no false
 int argTypeFrmtr(bool input, bool output, bool array, unsigned int type, unsigned int length = 0);
-
-enum AccessType { NONE, READ, WRITE };
-AccessType processAccessType(int flags);
 
 class FileUtil {
     const char *curr_dir;

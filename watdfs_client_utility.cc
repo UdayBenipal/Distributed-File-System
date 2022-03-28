@@ -18,8 +18,6 @@
 #include "debug.h"
 
 ////////////////////////////////////////////////////////////////////////////////////////////////
-int getattr_on_server(const char *path, struct stat *statbuf);
-int open_on_server(const char *path, struct fuse_file_info *fi);
 int read_on_server(const char *path, char *buf, size_t size, struct fuse_file_info *fi);
 int truncate_on_server(const char *path);
 int write_to_server(const char *path, const char *buf, size_t size, struct fuse_file_info *fi);
@@ -31,12 +29,23 @@ int unlock_on_server(const char *path, rw_lock_mode_t mode);
 ////////////////////////////////////////////////////////////////////////////////////////////////
 
 int download_file(FileUtil& fileUtil, const char *path, struct fuse_file_info *fi) {
-    const char* full_path = fileUtil.getAbsolutePath(path);
-    DLOG("Download file: %s\n", full_path);
+    DLOG("Download file: %s\n", path);
+
+    FileData* clientFileData = fileUtil.getClientFileData(path);
+    if (clientFileData == nullptr) {
+        DLOG("cannot find file in cache");
+        return -1; //TODO: better error
+    }
+    int fd_client = clientFileData->fh;
+    DLOG("File Descriptor: %d\n", fd_client);
 
     int ret = 0;
-    FileData* clientFileData = fileUtil.getClientFileData(path);
-    bool isOpen = (clientFileData != nullptr);
+
+    ret = ftruncate(fd_client, 0);
+    if (ret < 0) {
+        DLOG("Unable to truncate the file: %d\n", errno);
+        return -errno;
+    }
 
     ret = lock_on_server(path, RW_READ_LOCK);
     if (ret < 0) {
@@ -55,101 +64,49 @@ int download_file(FileUtil& fileUtil, const char *path, struct fuse_file_info *f
     }
     DLOG("Size: %ld\n", statbuf->st_size);
 
-    // open file on server based on provided flags
-    // fi->fh will have server file descriptor
-    if (!isOpen) {
-        int temp_flags = fi->flags;
-        if((fi->flags&O_ACCMODE) == O_WRONLY) fi->flags = O_RDWR;
-        ret = open_on_server(path, fi);
-        if (ret < 0) {
-            DLOG("Failed to open/create file on server due to error: %d\n", -ret);
-            unlock_on_server(path, RW_READ_LOCK);
-            return ret;
-        }
-        fi->flags = temp_flags;
-        DLOG("File Descriptor On Server: %ld\n", fi->fh);
-    }
-
-    // open/create file in client cache, truncate if it already exists
-    ret = open(full_path, O_CREAT|O_RDWR|O_TRUNC, statbuf->st_mode);
+    char *buf = new char[statbuf->st_size];
+    //read file from server
+    ret = read_on_server(path, buf, statbuf->st_size, fi);
     if (ret < 0) {
-        DLOG("Unable to create/open file in client cache due to error: %d\n", errno);
-        unlock_on_server(path, RW_READ_LOCK);
-        return -errno;
-    }
-    int temp_fd_client = ret;
-    DLOG("Temp File Descriptor: %d\n", temp_fd_client);
-
-    if (statbuf->st_size > 0) { //read and write if file is not empty
-        char *buf = new char[statbuf->st_size];
-        //read file from server
-        ret = read_on_server(path, buf, statbuf->st_size, fi);
-        if (ret < 0) {
-            DLOG("Failed to read from server due to error: %d\n", -ret);
-            delete []buf;
-            unlock_on_server(path, RW_READ_LOCK);
-            return ret;
-        }
-        DLOG("Buffer: %s\n", buf);
-
-        //write the file in client cache
-        ret = write(temp_fd_client, buf, statbuf->st_size);
-        if (ret < 0) {
-            DLOG("Unable to write in client cache due to error: %d\n", errno);
-            delete []buf;
-            unlock_on_server(path, RW_READ_LOCK);
-            return -errno;
-        }
+        DLOG("Failed to read from server due to error: %d\n", -ret);
         delete []buf;
+        unlock_on_server(path, RW_READ_LOCK);
+        return ret;
+    }
+    DLOG("Buffer: %s\n", buf);
+
+    ret = unlock_on_server(path, RW_READ_LOCK);
+    if (ret < 0) {
+        delete []buf;
+        DLOG("Unable to unlock it on server: %d\n", -ret);
+        return ret;
     }
 
-    //close on client
-    ret = close(temp_fd_client);
+    //write the file in client cache
+    ret = pwrite(fd_client, buf, statbuf->st_size, 0);
     if (ret < 0) {
-        DLOG("Unable to close in cache cache due to error: %d\n", errno);
-        unlock_on_server(path, RW_READ_LOCK);
+        DLOG("Unable to write in client cache due to error: %d\n", errno);
+        delete []buf;
         return -errno;
     }
-
-    int fd_client = -1;
-    if(isOpen) {
-        fd_client = clientFileData->fh;
-        fileUtil.updateTc(path);
-    } else {
-        ret = open(full_path, fi->flags);
-        if (ret < 0) {
-            DLOG("Unable to open corresponding to given flags: %d\n", errno);
-            unlock_on_server(path, RW_READ_LOCK);
-            return -errno;
-        }
-        fd_client = ret;
-
-        fileUtil.addClientFileData(path, fd_client, fi->fh, fi->flags);
-    }
+    delete []buf;
 
     //update file metadata in client cache
     struct timespec times[] {statbuf->st_atim, statbuf->st_mtim};
     ret = futimens(fd_client, times);
     if (ret < 0) {
         DLOG("Unable to update file time metadata in client cache due to error: %d\n", errno);
-        unlock_on_server(path, RW_READ_LOCK);
         return -errno;
     }
 
-    ret = unlock_on_server(path, RW_READ_LOCK);
-    if (ret < 0) DLOG("Unable to unlock it on server: %d\n", -ret);
-    DLOG("unblock done");
+    fileUtil.updateTc(path);
 
     return 0;
 }
 
 
-int upload_file(FileUtil& fileUtil, const char *path,
-                struct fuse_file_info *fi, bool closeFiles) {
-    const char* full_path = fileUtil.getAbsolutePath(path);
-    DLOG("Upload file: %s\n", full_path);
-
-    int ret = 0;
+int upload_file(FileUtil& fileUtil, const char *path, struct fuse_file_info *fi) {
+    DLOG("Upload file: %s\n", path);
 
     FileData* clientFileData = fileUtil.getClientFileData(path);
     if (clientFileData == nullptr) {
@@ -159,119 +116,84 @@ int upload_file(FileUtil& fileUtil, const char *path,
     int fd_client = clientFileData->fh;
     DLOG("File Descriptor: %d\n", fd_client);
 
+    int ret = 0;
+
+    //fsync all the data to file
     ret = fsync(fd_client);
     if (ret < 0) {
-        DLOG("fsync failed on the client due to error: %d", errno);
+        DLOG("Failed to fsyn on cache file due to error: %d\n", errno);
         return -errno;
     }
 
-    ret = open(full_path, O_RDWR);
+    RAII<struct stat> statbuf;
+    statbuf->st_size = 0; //set it to 0 before making the call
+    // getattr of file from cache
+    ret = fstat(fd_client, statbuf.ptr);
     if (ret < 0) {
-        DLOG("Unable to open file in client cache due to error: %d\n", errno);
+        DLOG("Failed to get the attributes due to error: %d\n", errno);
         return -errno;
     }
-    int temp_fd_client = ret;
-    DLOG("Temp File Descriptor: %d\n", temp_fd_client);
+    DLOG("Size: %ld\n", statbuf->st_size);
+
+    char *buf = new char[statbuf->st_size];
+    // read file from cache
+    ret = pread(fd_client, buf, statbuf->st_size, 0);
+    if (ret < 0) {
+        DLOG("Failed to read from cache due to error: %d\n", errno);
+        delete []buf;
+        return -errno;
+    }
+    DLOG("Buffer: %s\n", buf);
 
     ret = lock_on_server(path, RW_WRITE_LOCK);
     if (ret < 0) {
         DLOG("Failed to accquire lock on server: %d\n", -ret);
+        delete []buf;
         return ret;
     }
 
-    AccessType accessType = processAccessType(fi->flags);
-    if (accessType == WRITE) {
-        // getattr of file from cache
-        RAII<struct stat> statbuf;
-        statbuf->st_size = 0; //set it to 0 before making the call
-        ret = fstat(temp_fd_client, statbuf.ptr);
-        if (ret < 0) {
-            DLOG("Failed to get the attributes due to error: %d\n", errno);
-            unlock_on_server(path, RW_WRITE_LOCK);
-            return -errno;
-        }
-        DLOG("Size: %ld\n", statbuf->st_size);
-
-        ret = truncate_on_server(path);
-        if (ret < 0) {
-            DLOG("Failed to truncate on server due to error: %d\n", -ret);
-            unlock_on_server(path, RW_WRITE_LOCK);
-            return ret;
-        }
-
-        if (statbuf->st_size > 0) { //read and write if file is not empty
-            char *buf = new char[statbuf->st_size];
-
-            //read file from cache
-            ret = read(temp_fd_client, buf, statbuf->st_size);
-            if (ret < 0) {
-                DLOG("Failed to read from cache due to error: %d\n", errno);
-                delete []buf;
-                unlock_on_server(path, RW_WRITE_LOCK);
-                return -errno;
-            }
-            DLOG("Buffer: %s\n", buf);
-
-            //write the file to server
-            ret = write_to_server(path, buf, statbuf->st_size, fi);
-            if (ret < 0) {
-                DLOG("Unable to write in client cache due to error: %d\n", -ret);
-                delete []buf;
-                unlock_on_server(path, RW_WRITE_LOCK);
-                return ret;
-            }
-            delete []buf;
-        }
-
-        struct timespec times[] {statbuf->st_atim, statbuf->st_mtim};
-        ret = utimens_on_server(path, times);
-        if (ret < 0) {
-            DLOG("Unable to update time on server due to error: %d\n", -ret);
-            unlock_on_server(path, RW_WRITE_LOCK);
-            return ret;
-        }
-
-        fileUtil.updateTc(path);
-    }
-
-    //close on tmp file on client
-    ret = close(temp_fd_client);
+    //truncate on server
+    ret = truncate_on_server(path);
     if (ret < 0) {
-        DLOG("Unable to close tmp file due to error: %d\n", errno);
+        DLOG("Failed to truncate on server due to error: %d\n", -ret);
+        delete []buf;
         unlock_on_server(path, RW_WRITE_LOCK);
-        return -errno;
+        return ret;
     }
 
-    if (closeFiles) {
-        //close from server
-        ret = close_on_server(path, fi);
-        if (ret < 0) {
-            DLOG("Unable to close on server due to error: %d\n", -ret);
-            unlock_on_server(path, RW_WRITE_LOCK);
-            return ret;
-        }
+    //write the file to server
+    ret = write_to_server(path, buf, statbuf->st_size, fi);
+    if (ret < 0) {
+        DLOG("Unable to write in client cache due to error: %d\n", -ret);
+        delete []buf;
+        unlock_on_server(path, RW_WRITE_LOCK);
+        return ret;
+    }
 
-        //close on client
-        ret = close(fd_client);
-        if (ret < 0) {
-            DLOG("Unable to close in cache cache due to error: %d\n", errno);
-            unlock_on_server(path, RW_WRITE_LOCK);
-            return -errno;
-        }
+    delete []buf;
 
-        fileUtil.removeFile(path);
+    //update metadata on server
+    struct timespec times[] {statbuf->st_atim, statbuf->st_mtim};
+    ret = utimens_on_server(path, times);
+    if (ret < 0) {
+        DLOG("Unable to update time on server due to error: %d\n", -ret);
+        unlock_on_server(path, RW_WRITE_LOCK);
+        return ret;
     }
 
     ret = unlock_on_server(path, RW_WRITE_LOCK);
-    if (ret < 0) DLOG("Unable to unlock it on server: %d\n", -ret);
+    if (ret < 0) {
+        DLOG("Unable to unlock it on server: %d\n", -ret);
+        return ret;
+    }
 
-    return ret;
+    fileUtil.updateTc(path);
+
+    return 0;
 }
 
 bool isFresh(FileUtil& fileUtil, const char *path, struct fuse_file_info *fi) {
     DLOG("isFresh called for '%s'", path);
-
-    int ret = 0;
 
     FileData* clientFileData = fileUtil.getClientFileData(path);
     if (clientFileData == nullptr) {
@@ -280,6 +202,8 @@ bool isFresh(FileUtil& fileUtil, const char *path, struct fuse_file_info *fi) {
     }
     int fd_client = clientFileData->fh;
     DLOG("File Descriptor: %d\n", fd_client);
+
+    int ret = 0;
 
     struct timespec tp;
     ret = clock_gettime(CLOCK_REALTIME, &tp);

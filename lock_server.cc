@@ -21,13 +21,14 @@ class LockUtil {
     std::unordered_map<std::string, rw_lock_t*> map;
 
   public:
+
     int accuqire(const char *path, rw_lock_mode_t mode) {
+        DLOG("accuqire lock for %s\n", path);
         std::string key(path);
 
         mtx.lock();
-
+        
         int ret = 0;
-        rw_lock_t* lock = nullptr;
 
         if (map.find(key) == map.end()) {
             lock = (rw_lock_t*)malloc(sizeof(rw_lock_t));
@@ -38,11 +39,9 @@ class LockUtil {
                 return ret;
             }
             map[key] = lock;
-        } else {
-            lock = map.at(key);
         }
 
-        ret = rw_lock_lock(lock, mode);
+        ret = rw_lock_lock(map.at(key), mode);
         if(ret < 0) {
             DLOG("unable to lock the lock for %s\n", path);
             mtx.unlock();
@@ -54,11 +53,10 @@ class LockUtil {
     }
 
     int release(const char *path, rw_lock_mode_t mode) {
+        DLOG("release lock for %s\n", path);
         std::string key(path);
 
         mtx.lock();
-
-        int ret = 0;
 
         if (map.find(key) == map.end()) {
             DLOG("lock not found to unlock for %s\n", path);
@@ -66,23 +64,11 @@ class LockUtil {
             return -1;
         }
 
-        rw_lock_t* lock = map.at(key); 
-        ret = rw_lock_unlock(lock, mode);
+        int ret = rw_lock_unlock(map.at(key), mode);
         if(ret < 0) {
             DLOG("unable to unlock the lock for %s\n", path);
             mtx.unlock();
             return ret;
-        }
-
-        if (lock->num_readers_ == 0 && lock->num_writers_ == 0) {
-            ret = rw_lock_destroy(lock);
-            if(ret < 0) {
-                DLOG("unable to destroy lock for %s\n", path);
-                mtx.unlock();
-                return ret;
-            }
-            free(lock);
-            map.erase(key);
         }
 
         mtx.unlock();

@@ -12,7 +12,7 @@ AccessType processAccessType(int flags) {
 }
 
 int argTypeFrmtr(bool input, bool output, bool array, unsigned int type, unsigned int length) {
-    assert(!array || (array && length>0));
+    // assert(!array || (array && length>0));
     unsigned int code = 0;
     if (input) code = 1u << ARG_INPUT;
     if (output) code |= (1u << ARG_OUTPUT);
@@ -43,13 +43,10 @@ const char* FileUtil::getAbsolutePath(const char* file_path) {
 void FileUtil::addClientFileData(const char* file, int fh, int server_fh, int flags) {
     DLOG("addClientFileData for %s", file);
     std::string key(file);
+    AccessType accessType = processAccessType(flags);
+    struct timespec t; clock_gettime(CLOCK_REALTIME, &t);
 
-    struct timespec t;
-    clock_gettime(CLOCK_REALTIME, &t);
-
-    mtx.lock();
-    map[key] = new FileData(fh, t.tv_sec, server_fh, flags);
-    mtx.unlock();
+    map[key] = new FileData(fh, server_fh, accessType, flags, t.tv_sec);
 }
 
 void FileUtil::updateTc(const char* file) {
@@ -59,9 +56,7 @@ void FileUtil::updateTc(const char* file) {
     struct timespec t;
     clock_gettime(CLOCK_REALTIME, &t);
 
-    mtx.lock();
     if (map.find(key) != map.end()) map.at(key)->tc = t.tv_sec;
-    mtx.unlock();
 }
 
 FileData* FileUtil::getClientFileData(const char* file) {
@@ -69,9 +64,7 @@ FileData* FileUtil::getClientFileData(const char* file) {
     std::string key(file);
     FileData *fileData = nullptr;
 
-    mtx.lock();
     if (map.find(key) != map.end()) fileData = map.at(key);
-    mtx.unlock();
 
     return fileData;
 }

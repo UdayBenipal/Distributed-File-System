@@ -61,35 +61,49 @@ void watdfs_cli_destroy(void *userdata) {
 
 // GET FILE ATTRIBUTES
 int watdfs_cli_getattr(void *userdata, const char *path, struct stat *statbuf) {
-    // SET UP THE RPC CALL
     DLOG("watdfs_cli_getattr called for '%s'", path);
+    FileData* clientFileData = fileUtil.getClientFileData(path);
+    const bool isOpen = (clientFileData != nullptr);
     
     int ret = 0;
 
-    FileData* clientFileData = fileUtil.getClientFileData(path);
-    const bool isOpen = (clientFileData != nullptr);
-
     RAII<struct fuse_file_info> fi;
-    if (isOpen) { fi->flags = clientFileData->flags; fi->fh = clientFileData->server_fh; }
-    else fi->flags = O_RDONLY;
 
-    AccessType accessType = processAccessType(fi->flags);
-    if (!isOpen || (READ == accessType && !isFresh(fileUtil, path, fi.ptr))) {
+    if (!isOpen) {
+        fi->flags = O_RDONLY;
+        ret = watdfs_cli_open(userdata, path, fi.ptr);
+        if (ret < 0) {
+            DLOG("getAttr: file could not be opened due to error: %d", -ret);
+            memset(statbuf, 0, sizeof(struct stat));
+            return ret;
+        }
+
+        clientFileData = fileUtil.getClientFileData(path);
+        if (clientFileData == nullptr) {
+            DLOG("getAttr: file could not found in cache");
+            memset(statbuf, 0, sizeof(struct stat));
+            return -1;
+        }
+
+    } else if (isOpen && READ == clientFileData->accessType && !isFresh(fileUtil, path, fi.ptr)) {
         ret = download_file(fileUtil, path, fi.ptr);
         if (ret < 0) {
             DLOG("getattr: download failed");
             memset(statbuf, 0, sizeof(struct stat));
             return ret;
         }
-        if (!isOpen) {
-            clientFileData = fileUtil.getClientFileData(path);
-            if (clientFileData == nullptr) {
-                DLOG("getattr: cannot find file in cache after download");
-                memset(statbuf, 0, sizeof(struct stat));
-                return -1; //TODO: better error
-            }
+        
+        clientFileData = fileUtil.getClientFileData(path);
+        if (clientFileData == nullptr) {
+            DLOG("getattr: could not find file in cache after download");
+            memset(statbuf, 0, sizeof(struct stat));
+            return -1;
         }
+
     } else DLOG("getattr: its fresh");
+
+    fi->fh = clientFileData->server_fh;
+    fi->flags = clientFileData->flags;
 
     int fd_client = clientFileData->fh;
     DLOG("File Descriptor: %d\n", fd_client);
@@ -102,12 +116,13 @@ int watdfs_cli_getattr(void *userdata, const char *path, struct stat *statbuf) {
     }
 
     if (!isOpen) {
-        ret = upload_file(fileUtil, path, fi.ptr, true);
+        ret = watdfs_cli_release(userdata, path, fi.ptr);
         if (ret < 0) {
-            DLOG("getAttr: upload failed");
-            return -1; //TODO: better error
+            DLOG("getAttr: file could not be released due to error: %d", -ret);
+            return ret;
         }
     }
+
     return 0;
 }
 
@@ -143,8 +158,7 @@ int watdfs_cli_mknod(void *userdata, const char *path, mode_t mode, dev_t dev) {
 
     delete []args;
 
-    const char* full_path = fileUtil.getAbsolutePath(path);
-    int sys_ret = mknod(full_path, mode, dev);
+    int sys_ret = mknod(fileUtil.getAbsolutePath(path), mode, dev);
     if (sys_ret < 0) { DLOG("mknod failed for cache with error: %d", errno); fxn_ret = -errno; }
 
     return fxn_ret;
@@ -157,6 +171,33 @@ int watdfs_cli_open(void *userdata, const char *path, struct fuse_file_info *fi)
     if (isOpen) { DLOG("File is already open"); return -EMFILE; }
 
     int ret = 0;
+
+    RAII<struct stat> statbuf;
+    ret = getattr_on_server(path, statbuf.ptr);
+    if (ret < 0) {
+        DLOG("Failed to get the attributes due to error: %d\n", -ret);
+        return ret;
+    }
+
+    int temp_flags = fi->flags;
+    if((fi->flags&O_ACCMODE) == O_WRONLY) fi->flags = O_RDWR;
+    ret = open_on_server(path, fi);
+    if (ret < 0) {
+        DLOG("Failed to open file on server due to error: %d\n", -ret);
+        return ret;
+    }
+    fi->flags = temp_flags;
+    DLOG("File Descriptor On Server: %ld\n", fi->fh);
+
+    ret = open(fileUtil.getAbsolutePath(path), O_CREAT|O_RDWR, statbuf->st_mode);
+    if (ret < 0) {
+        DLOG("Unable to open corresponding to given flags: %d\n", errno);
+        return -errno;
+    }
+    int fd_client = ret;
+
+    fileUtil.addClientFileData(path, fd_client, fi->fh, fi->flags);
+
     ret = download_file(fileUtil, path, fi);
 
     return ret;
@@ -165,10 +206,41 @@ int watdfs_cli_open(void *userdata, const char *path, struct fuse_file_info *fi)
 int watdfs_cli_release(void *userdata, const char *path, struct fuse_file_info *fi) {
     DLOG("watdfs_cli_release called for '%s'", path);
 
-    int ret = 0;
-    ret = upload_file(fileUtil, path, fi, true);
+    FileData* clientFileData = fileUtil.getClientFileData(path);
+    if (clientFileData == nullptr) {
+        DLOG("cannot find file in cache");
+        return -1; //TODO: better error
+    }
+    int fd_client = clientFileData->fh;
+    DLOG("File Descriptor: %d\n", fd_client);
 
-    return ret;
+    int ret = 0;
+
+    if (WRITE == clientFileData->accessType) {
+        ret = upload_file(fileUtil, path, fi);
+        if (ret < 0) {
+            DLOG("failed to upload to server due to error: %d\n", -ret);
+            return ret;
+        }
+    }
+
+    //close from server
+    ret = close_on_server(path, fi);
+    if (ret < 0) {
+        DLOG("Unable to close on server due to error: %d\n", -ret);
+        return ret;
+    }
+
+    //close on client
+    ret = close(fd_client);
+    if (ret < 0) {
+        DLOG("Unable to close in cache cache due to error: %d\n", errno);
+        return -errno;
+    }
+
+    fileUtil.removeFile(path);
+
+    return 0;
 }
 
 // READ AND WRITE DATA
@@ -176,28 +248,25 @@ int watdfs_cli_read(void *userdata, const char *path, char *buf, size_t size,
                     off_t offset, struct fuse_file_info *fi) {
     DLOG("watdfs_cli_read called for '%s'", path);
 
-    int ret = 0;
-
-    AccessType accessType = processAccessType(fi->flags);
-    if (READ == accessType && !isFresh(fileUtil, path, fi)) {
-        ret = download_file(fileUtil, path, fi);
-        if (ret < 0) {
-            DLOG("read: download failed");
-            return -1; //TODO: better error
-        }
-    } else DLOG("read: its fresh");
-
     FileData* clientFileData = fileUtil.getClientFileData(path);
     if (clientFileData == nullptr) {
-        DLOG("read: cannot find file in cache even after download");
+        DLOG("cannot find file for read");
         return -1; //TODO: better error
     }
     int fd_client = clientFileData->fh;
     DLOG("File Descriptor: %d\n", fd_client);
 
-    // fd_client = open(fileUtil.getAbsolutePath(path), fi->flags);
+    int ret = 0;
 
-    DLOG("File Descriptor: %d\n", fd_client);
+    if (READ == clientFileData->accessType && !isFresh(fileUtil, path, fi)) {
+        DLOG("read: its not fresh");
+        ret = download_file(fileUtil, path, fi);
+        if (ret < 0) {
+            DLOG("read: download failed");
+            return ret;
+        }
+    } else DLOG("read: its fresh");
+
     //read from file on cache
     ret = pread(fd_client, buf, size, offset);
     if (ret < 0) {
@@ -216,7 +285,7 @@ int watdfs_cli_write(void *userdata, const char *path, const char *buf,
 
     FileData* clientFileData = fileUtil.getClientFileData(path);
     if (clientFileData == nullptr) {
-        DLOG("write: cannot find file in cache even after download");
+        DLOG("write: cannot find file in cache");
         return -1; //TODO: better error
     }
     int fd_client = clientFileData->fh;
@@ -230,10 +299,11 @@ int watdfs_cli_write(void *userdata, const char *path, const char *buf,
     }
 
     if (!isFresh(fileUtil, path, fi)) {
+        DLOG("write: its not fresh");
         ret = upload_file(fileUtil, path, fi);
         if (ret < 0) {
             DLOG("write: upload failed");
-            return -1; //TODO: better error
+            return ret;
         }
     } else DLOG("write: its fresh");
 
@@ -245,36 +315,51 @@ int watdfs_cli_truncate(void *userdata, const char *path, off_t newsize) {
 
     FileData* clientFileData = fileUtil.getClientFileData(path);
     const bool isOpen = (clientFileData != nullptr);
-    AccessType accessType = NONE;
-    if(isOpen) accessType = processAccessType(clientFileData->flags);
+
+    int ret = 0;
 
     RAII<struct fuse_file_info> fi;
-
     if (!isOpen) {
         fi->flags = O_RDWR;
-        download_file(fileUtil, path, fi.ptr);
+        ret = watdfs_cli_open(userdata, path, fi.ptr);
+        if (ret < 0) {
+            DLOG("truncate: file could not be opened due to error: %d", -ret);
+            return ret;
+        }
+
         clientFileData = fileUtil.getClientFileData(path);
         if (clientFileData == nullptr) {
-            DLOG("truncate: cannot find file in cache after download");
-            return -1; //TODO: better error
+            DLOG("truncate: file could not found in cache");
+            return -1;
         }
-    } else if (READ==accessType) { DLOG("File is open in read mode"); return -EMFILE; }
+    } else if (isOpen && READ==clientFileData->accessType) {
+        DLOG("File is open in read mode");
+        return -EMFILE;
+    }
+
+    fi->fh = clientFileData->server_fh;
+    fi->flags = clientFileData->flags;
 
     int fd_client = clientFileData->fh;
     DLOG("File Descriptor: %d\n", fd_client);
 
-    int ret = 0;
     ret = ftruncate(fd_client, newsize);
     if (ret < 0) {
         DLOG("truncate failed on cache file with error: %d\n", errno);
         return -errno;
     }
 
-    if (!isOpen || !isFresh(fileUtil, path, fi.ptr)) {
-        ret = upload_file(fileUtil, path, fi.ptr, !isOpen);
+    if (!isOpen) {
+        ret = watdfs_cli_release(userdata, path, fi.ptr);
         if (ret < 0) {
-            DLOG("truncate: upload failed");
-            return -1; //TODO: better error
+            DLOG("truncate: file could not be released due to error: %d", -ret);
+            return ret;
+        }
+    } else if (!isFresh(fileUtil, path, fi.ptr)) {
+        ret = upload_file(fileUtil, path, fi.ptr);
+        if (ret < 0) {
+            DLOG("truncate: upload to update data failed");
+            return ret;
         }
     }
 
@@ -285,15 +370,13 @@ int watdfs_cli_fsync(void *userdata, const char *path,
                      struct fuse_file_info *fi) {
     DLOG("watdfs_cli_fsync called for '%s'", path);
 
-    
     FileData* clientFileData = fileUtil.getClientFileData(path);
     if (clientFileData == nullptr) {
         DLOG("fsync called on a closed file");
         return -10;
     }
 
-    AccessType accessType = processAccessType(clientFileData->flags);
-    if (accessType == READ) {
+    if (clientFileData->accessType == READ) {
         DLOG("fsync called on read only file");
         return -1;
     }
@@ -305,38 +388,54 @@ int watdfs_cli_fsync(void *userdata, const char *path,
 
 // CHANGE METADATA
 int watdfs_cli_utimens(void *userdata, const char *path, const struct timespec ts[2]) {
+    DLOG("watdfs_cli_utimens called for '%s'", path);
     FileData* clientFileData = fileUtil.getClientFileData(path);
     const bool isOpen = (clientFileData != nullptr);
-    AccessType accessType = NONE;
-    if(isOpen) accessType = processAccessType(clientFileData->flags);
+
+    int ret = 0;
 
     RAII<struct fuse_file_info> fi;
-
     if (!isOpen) {
         fi->flags = O_RDWR;
-        download_file(fileUtil, path, fi.ptr);
+        ret = watdfs_cli_open(userdata, path, fi.ptr);
+        if (ret < 0) {
+            DLOG("utimens: file could not be opened due to error: %d", -ret);
+            return ret;
+        }
+
         clientFileData = fileUtil.getClientFileData(path);
         if (clientFileData == nullptr) {
-            DLOG("utimens: cannot find file in cache after download");
-            return -1; //TODO: better error
+            DLOG("utimens: file could not found in cache");
+            return -1;
         }
-    } else if (READ==accessType) { DLOG("File is open in read mode"); return -EMFILE; }
+    } else if (isOpen && READ==clientFileData->accessType) {
+        DLOG("File is open in read mode");
+        return -EMFILE;
+    }
+
+    fi->fh = clientFileData->server_fh;
+    fi->flags = clientFileData->flags;
 
     int fd_client = clientFileData->fh;
     DLOG("File Descriptor: %d\n", fd_client);
 
-    int ret = 0;
     ret = futimens(fd_client, ts);
     if (ret < 0) {
         DLOG("utimens failed on cache file with error: %d\n", errno);
         return -errno;
     }
 
-    if (!isOpen || !isFresh(fileUtil, path, fi.ptr)) {
-        ret = upload_file(fileUtil, path, fi.ptr, !isOpen);
+    if (!isOpen) {
+        ret = watdfs_cli_release(userdata, path, fi.ptr);
         if (ret < 0) {
-            DLOG("utimens: upload failed");
-            return -1; //TODO: better error
+            DLOG("utimens: file could not be released due to error: %d", -ret);
+            return ret;
+        }
+    } else if (!isFresh(fileUtil, path, fi.ptr)) {
+        ret = upload_file(fileUtil, path, fi.ptr);
+        if (ret < 0) {
+            DLOG("utimens: upload to update data failed");
+            return ret;
         }
     }
 

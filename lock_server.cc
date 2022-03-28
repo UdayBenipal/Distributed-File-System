@@ -31,7 +31,7 @@ class LockUtil {
         int ret = 0;
 
         if (map.find(key) == map.end()) {
-            lock = (rw_lock_t*)malloc(sizeof(rw_lock_t));
+            rw_lock_t* lock = (rw_lock_t*)malloc(sizeof(rw_lock_t));
             ret = rw_lock_init(lock);
             if(ret < 0) {
                 DLOG("unable to init the lock for %s\n", path);

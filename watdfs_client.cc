@@ -11,8 +11,6 @@ INIT_LOG
 
 #include "watdfs_client_utility.h"
 
-FileUtil fileUtil;
-
 // SETUP AND TEARDOWN
 void *watdfs_cli_init(struct fuse_conn_info *conn, const char *path_to_cache,
                       time_t cache_interval, int *ret_code) {
@@ -29,13 +27,14 @@ void *watdfs_cli_init(struct fuse_conn_info *conn, const char *path_to_cache,
 #endif
     }
 
-    fileUtil.setDir(path_to_cache);
-    fileUtil.cacheInterval = cache_interval;
+    FileUtil* userdata = new FileUtil;
+
+    userdata->setDir(path_to_cache);
+    userdata->cacheInterval = cache_interval;
 
     // TODO Initialize any global state that you require for the assignment and return it.
     // The value that you return here will be passed as userdata in other functions.
     // In A1, you might not need it, so you can return `nullptr`.
-    void *userdata = nullptr;
 
     // TODO: save `path_to_cache` and `cache_interval` (for A3).
 
@@ -43,11 +42,13 @@ void *watdfs_cli_init(struct fuse_conn_info *conn, const char *path_to_cache,
     // non-zero value.
 
     // Return pointer to global state data.
-    return userdata;
+    return (void *)userdata;
 }
 
 void watdfs_cli_destroy(void *userdata) {
     // TODO: clean up your userdata state.
+
+    delete (FileUtil*)userdata;
 
     int ret = 0;
     ret = rpcClientDestroy();
@@ -62,7 +63,8 @@ void watdfs_cli_destroy(void *userdata) {
 // GET FILE ATTRIBUTES
 int watdfs_cli_getattr(void *userdata, const char *path, struct stat *statbuf) {
     DLOG("watdfs_cli_getattr called for '%s'", path);
-    FileData* clientFileData = fileUtil.getClientFileData(path);
+    FileUtil* fileUtil = (FileUtil *)userdata;
+    FileData* clientFileData = fileUtil->getClientFileData(path);
     const bool isOpen = (clientFileData != nullptr);
     
     int ret = 0;
@@ -78,7 +80,7 @@ int watdfs_cli_getattr(void *userdata, const char *path, struct stat *statbuf) {
             return ret;
         }
 
-        clientFileData = fileUtil.getClientFileData(path);
+        clientFileData = fileUtil->getClientFileData(path);
         if (clientFileData == nullptr) {
             DLOG("getAttr: file could not found in cache");
             memset(statbuf, 0, sizeof(struct stat));
@@ -93,7 +95,7 @@ int watdfs_cli_getattr(void *userdata, const char *path, struct stat *statbuf) {
             return ret;
         }
         
-        clientFileData = fileUtil.getClientFileData(path);
+        clientFileData = fileUtil->getClientFileData(path);
         if (clientFileData == nullptr) {
             DLOG("getattr: could not find file in cache after download");
             memset(statbuf, 0, sizeof(struct stat));
@@ -129,6 +131,7 @@ int watdfs_cli_getattr(void *userdata, const char *path, struct stat *statbuf) {
 // CREATE, OPEN AND CLOSE
 int watdfs_cli_mknod(void *userdata, const char *path, mode_t mode, dev_t dev) {
     DLOG("watdfs_cli_mknod called for '%s'", path);
+    FileUtil* fileUtil = (FileUtil *)userdata;
 
     int ARG_COUNT = 4;
     void **args = new void*[ARG_COUNT];
@@ -158,7 +161,7 @@ int watdfs_cli_mknod(void *userdata, const char *path, mode_t mode, dev_t dev) {
 
     delete []args;
 
-    int sys_ret = mknod(fileUtil.getAbsolutePath(path), mode, dev);
+    int sys_ret = mknod(fileUtil->getAbsolutePath(path), mode, dev);
     if (sys_ret < 0) { DLOG("mknod failed for cache with error: %d", errno); fxn_ret = -errno; }
 
     return fxn_ret;
@@ -166,8 +169,9 @@ int watdfs_cli_mknod(void *userdata, const char *path, mode_t mode, dev_t dev) {
 
 int watdfs_cli_open(void *userdata, const char *path, struct fuse_file_info *fi) {
     DLOG("watdfs_cli_open called for '%s'", path);
+    FileUtil* fileUtil = (FileUtil *)userdata;
 
-    const bool isOpen = (fileUtil.getClientFileData(path) != nullptr);
+    const bool isOpen = (fileUtil->getClientFileData(path) != nullptr);
     if (isOpen) { DLOG("File is already open"); return -EMFILE; }
 
     int ret = 0;
@@ -189,14 +193,14 @@ int watdfs_cli_open(void *userdata, const char *path, struct fuse_file_info *fi)
     fi->flags = temp_flags;
     DLOG("File Descriptor On Server: %ld\n", fi->fh);
 
-    ret = open(fileUtil.getAbsolutePath(path), O_CREAT|O_RDWR, statbuf->st_mode);
+    ret = open(fileUtil->getAbsolutePath(path), O_CREAT|O_RDWR, statbuf->st_mode);
     if (ret < 0) {
         DLOG("Unable to open corresponding to given flags: %d\n", errno);
         return -errno;
     }
     int fd_client = ret;
 
-    fileUtil.addClientFileData(path, fd_client, fi->fh, fi->flags);
+    fileUtil->addClientFileData(path, fd_client, fi->fh, fi->flags);
 
     ret = download_file(fileUtil, path, fi);
 
@@ -205,8 +209,9 @@ int watdfs_cli_open(void *userdata, const char *path, struct fuse_file_info *fi)
 
 int watdfs_cli_release(void *userdata, const char *path, struct fuse_file_info *fi) {
     DLOG("watdfs_cli_release called for '%s'", path);
+    FileUtil* fileUtil = (FileUtil *)userdata;
 
-    FileData* clientFileData = fileUtil.getClientFileData(path);
+    FileData* clientFileData = fileUtil->getClientFileData(path);
     if (clientFileData == nullptr) {
         DLOG("cannot find file in cache");
         return -1; //TODO: better error
@@ -238,7 +243,7 @@ int watdfs_cli_release(void *userdata, const char *path, struct fuse_file_info *
         return -errno;
     }
 
-    fileUtil.removeFile(path);
+    fileUtil->removeFile(path);
 
     return 0;
 }
@@ -247,8 +252,9 @@ int watdfs_cli_release(void *userdata, const char *path, struct fuse_file_info *
 int watdfs_cli_read(void *userdata, const char *path, char *buf, size_t size,
                     off_t offset, struct fuse_file_info *fi) {
     DLOG("watdfs_cli_read called for '%s'", path);
+    FileUtil* fileUtil = (FileUtil *)userdata;
 
-    FileData* clientFileData = fileUtil.getClientFileData(path);
+    FileData* clientFileData = fileUtil->getClientFileData(path);
     if (clientFileData == nullptr) {
         DLOG("cannot find file for read");
         return -1; //TODO: better error
@@ -280,10 +286,11 @@ int watdfs_cli_read(void *userdata, const char *path, char *buf, size_t size,
 int watdfs_cli_write(void *userdata, const char *path, const char *buf,
                      size_t size, off_t offset, struct fuse_file_info *fi) {
     DLOG("watdfs_cli_write called for '%s'", path);
+    FileUtil* fileUtil = (FileUtil *)userdata;
 
     int ret = 0;
 
-    FileData* clientFileData = fileUtil.getClientFileData(path);
+    FileData* clientFileData = fileUtil->getClientFileData(path);
     if (clientFileData == nullptr) {
         DLOG("write: cannot find file in cache");
         return -1; //TODO: better error
@@ -312,8 +319,9 @@ int watdfs_cli_write(void *userdata, const char *path, const char *buf,
 
 int watdfs_cli_truncate(void *userdata, const char *path, off_t newsize) {
     DLOG("watdfs_cli_truncate called for '%s'", path);
+    FileUtil* fileUtil = (FileUtil *)userdata;
 
-    FileData* clientFileData = fileUtil.getClientFileData(path);
+    FileData* clientFileData = fileUtil->getClientFileData(path);
     const bool isOpen = (clientFileData != nullptr);
 
     int ret = 0;
@@ -327,7 +335,7 @@ int watdfs_cli_truncate(void *userdata, const char *path, off_t newsize) {
             return ret;
         }
 
-        clientFileData = fileUtil.getClientFileData(path);
+        clientFileData = fileUtil->getClientFileData(path);
         if (clientFileData == nullptr) {
             DLOG("truncate: file could not found in cache");
             return -1;
@@ -369,8 +377,9 @@ int watdfs_cli_truncate(void *userdata, const char *path, off_t newsize) {
 int watdfs_cli_fsync(void *userdata, const char *path,
                      struct fuse_file_info *fi) {
     DLOG("watdfs_cli_fsync called for '%s'", path);
+    FileUtil* fileUtil = (FileUtil *)userdata;
 
-    FileData* clientFileData = fileUtil.getClientFileData(path);
+    FileData* clientFileData = fileUtil->getClientFileData(path);
     if (clientFileData == nullptr) {
         DLOG("fsync called on a closed file");
         return -10;
@@ -389,7 +398,9 @@ int watdfs_cli_fsync(void *userdata, const char *path,
 // CHANGE METADATA
 int watdfs_cli_utimens(void *userdata, const char *path, const struct timespec ts[2]) {
     DLOG("watdfs_cli_utimens called for '%s'", path);
-    FileData* clientFileData = fileUtil.getClientFileData(path);
+    FileUtil* fileUtil = (FileUtil *)userdata;
+
+    FileData* clientFileData = fileUtil->getClientFileData(path);
     const bool isOpen = (clientFileData != nullptr);
 
     int ret = 0;
@@ -403,7 +414,7 @@ int watdfs_cli_utimens(void *userdata, const char *path, const struct timespec t
             return ret;
         }
 
-        clientFileData = fileUtil.getClientFileData(path);
+        clientFileData = fileUtil->getClientFileData(path);
         if (clientFileData == nullptr) {
             DLOG("utimens: file could not found in cache");
             return -1;

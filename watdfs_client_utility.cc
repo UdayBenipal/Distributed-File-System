@@ -22,16 +22,17 @@ int read_on_server(const char *path, char *buf, size_t size, struct fuse_file_in
 int truncate_on_server(const char *path);
 int write_to_server(const char *path, const char *buf, size_t size, struct fuse_file_info *fi);
 int close_on_server(const char *path, struct fuse_file_info *fi);
+int fsync_on_server(const char *path, struct fuse_file_info *fi);
 int utimens_on_server(const char *path, const struct timespec ts[2]);
 ////////////////////////////////////////////////////////////////////////////////////////////////
 int lock_on_server(const char *path, rw_lock_mode_t mode);
 int unlock_on_server(const char *path, rw_lock_mode_t mode);
 ////////////////////////////////////////////////////////////////////////////////////////////////
 
-int download_file(FileUtil& fileUtil, const char *path, struct fuse_file_info *fi) {
+int download_file(FileUtil* fileUtil, const char *path, struct fuse_file_info* fi) {
     DLOG("Download file: %s\n", path);
 
-    FileData* clientFileData = fileUtil.getClientFileData(path);
+    FileData* clientFileData = fileUtil->getClientFileData(path);
     if (clientFileData == nullptr) {
         DLOG("cannot find file in cache");
         return -1; //TODO: better error
@@ -47,9 +48,9 @@ int download_file(FileUtil& fileUtil, const char *path, struct fuse_file_info *f
         return -errno;
     }
 
-    ret = lock_on_server(path, RW_READ_LOCK);
+    ret = fsync_on_server(path, fi);
     if (ret < 0) {
-        DLOG("Failed to accquire lock on server: %d\n", -ret);
+        DLOG("Failed to fsync on server due to error: %d\n", -ret);
         return ret;
     }
 
@@ -59,10 +60,15 @@ int download_file(FileUtil& fileUtil, const char *path, struct fuse_file_info *f
     ret = getattr_on_server(path, statbuf.ptr);
     if (ret < 0) {
         DLOG("Failed to get the attributes due to error: %d\n", -ret);
-        unlock_on_server(path, RW_READ_LOCK);
         return ret;
     }
     DLOG("Size: %ld\n", statbuf->st_size);
+
+    ret = lock_on_server(path, RW_READ_LOCK);
+    if (ret < 0) {
+        DLOG("Failed to accquire lock on server: %d\n", -ret);
+        return ret;
+    }
 
     char *buf = new char[statbuf->st_size];
     //read file from server
@@ -99,16 +105,16 @@ int download_file(FileUtil& fileUtil, const char *path, struct fuse_file_info *f
         return -errno;
     }
 
-    fileUtil.updateTc(path);
+    fileUtil->updateTc(path);
 
     return 0;
 }
 
 
-int upload_file(FileUtil& fileUtil, const char *path, struct fuse_file_info *fi) {
+int upload_file(FileUtil* fileUtil, const char *path, struct fuse_file_info *fi) {
     DLOG("Upload file: %s\n", path);
 
-    FileData* clientFileData = fileUtil.getClientFileData(path);
+    FileData* clientFileData = fileUtil->getClientFileData(path);
     if (clientFileData == nullptr) {
         DLOG("cannot find file in cache");
         return -1; //TODO: better error
@@ -121,7 +127,7 @@ int upload_file(FileUtil& fileUtil, const char *path, struct fuse_file_info *fi)
     //fsync all the data to file
     ret = fsync(fd_client);
     if (ret < 0) {
-        DLOG("Failed to fsyn on cache file due to error: %d\n", errno);
+        DLOG("Failed to fsync on cache file due to error: %d\n", errno);
         return -errno;
     }
 
@@ -145,19 +151,18 @@ int upload_file(FileUtil& fileUtil, const char *path, struct fuse_file_info *fi)
     }
     DLOG("Buffer: %s\n", buf);
 
-    ret = lock_on_server(path, RW_WRITE_LOCK);
-    if (ret < 0) {
-        DLOG("Failed to accquire lock on server: %d\n", -ret);
-        delete []buf;
-        return ret;
-    }
-
     //truncate on server
     ret = truncate_on_server(path);
     if (ret < 0) {
         DLOG("Failed to truncate on server due to error: %d\n", -ret);
         delete []buf;
-        unlock_on_server(path, RW_WRITE_LOCK);
+        return ret;
+    }
+
+    ret = lock_on_server(path, RW_WRITE_LOCK);
+    if (ret < 0) {
+        DLOG("Failed to accquire lock on server: %d\n", -ret);
+        delete []buf;
         return ret;
     }
 
@@ -172,30 +177,29 @@ int upload_file(FileUtil& fileUtil, const char *path, struct fuse_file_info *fi)
 
     delete []buf;
 
-    //update metadata on server
-    struct timespec times[] {statbuf->st_atim, statbuf->st_mtim};
-    ret = utimens_on_server(path, times);
-    if (ret < 0) {
-        DLOG("Unable to update time on server due to error: %d\n", -ret);
-        unlock_on_server(path, RW_WRITE_LOCK);
-        return ret;
-    }
-
     ret = unlock_on_server(path, RW_WRITE_LOCK);
     if (ret < 0) {
         DLOG("Unable to unlock it on server: %d\n", -ret);
         return ret;
     }
 
-    fileUtil.updateTc(path);
+    //update metadata on server
+    struct timespec times[] {statbuf->st_atim, statbuf->st_mtim};
+    ret = utimens_on_server(path, times);
+    if (ret < 0) {
+        DLOG("Unable to update time on server due to error: %d\n", -ret);
+        return ret;
+    }
+
+    fileUtil->updateTc(path);
 
     return 0;
 }
 
-bool isFresh(FileUtil& fileUtil, const char *path, struct fuse_file_info *fi) {
+bool isFresh(FileUtil* fileUtil, const char *path, struct fuse_file_info *fi) {
     DLOG("isFresh called for '%s'", path);
 
-    FileData* clientFileData = fileUtil.getClientFileData(path);
+    FileData* clientFileData = fileUtil->getClientFileData(path);
     if (clientFileData == nullptr) {
         DLOG("isFresh: Unable to find the file in cache");
         return false; //TODO: Find a appropriate error code
@@ -214,7 +218,7 @@ bool isFresh(FileUtil& fileUtil, const char *path, struct fuse_file_info *fi) {
     time_t t = tp.tv_sec;
 
     // [T - Tc < t]
-    if (t - clientFileData->tc < fileUtil.cacheInterval) return true;
+    if (t - clientFileData->tc < fileUtil->cacheInterval) return true;
 
     // getattr of file from cache
     RAII<struct stat> statbuf;
@@ -490,6 +494,37 @@ int close_on_server(const char *path, struct fuse_file_info *fi) {
 
     int fxn_ret = 0;
     if (rpc_ret < 0) { DLOG("release rpc failed with error '%d'", rpc_ret); fxn_ret = -EINVAL; }
+    else fxn_ret = *ret;
+
+    delete []args;
+
+    return fxn_ret;
+}
+
+int fsync_on_server(const char *path, struct fuse_file_info *fi) {
+    DLOG("fsync called for '%s'", path);
+
+    int ARG_COUNT = 3;
+    void **args = new void*[ARG_COUNT];
+    int arg_types[ARG_COUNT + 1];
+
+    int pathlen = strlen(path) + 1;
+    arg_types[0] = argTypeFrmtr(yes, no, yes, ARG_CHAR, (uint) pathlen); //path
+    args[0] = (void *)path;
+
+    arg_types[1] = argTypeFrmtr(yes, no, yes, ARG_CHAR, (uint) sizeof(struct fuse_file_info)); //fi
+    args[1] = (void *)(fi);
+
+    RAII<int> ret(0);
+    arg_types[2] = argTypeFrmtr(no, yes, no, ARG_INT); //retcode
+    args[2] = (void *)ret.ptr;
+
+    arg_types[3] = 0;
+
+    int rpc_ret = rpcCall((char *)"fsync", arg_types, args);
+
+    int fxn_ret = 0;
+    if (rpc_ret < 0) { DLOG("fsync rpc failed with error '%d'", rpc_ret); fxn_ret = -EINVAL; }
     else fxn_ret = *ret;
 
     delete []args;

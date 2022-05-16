@@ -23,7 +23,7 @@ CXXFLAGS += $(shell pkg-config --cflags fuse)
 CXXFLAGS += -g -Wall -std=c++1y -MMD
 
 # If you want to disable logging messages from DLOG, uncomment the next line.
-# CXXFLAGS += -DNDEBUG
+CXXFLAGS += -DNDEBUG
 
 # To stop error printing, comment out next line
 # CXXFLAGS += -DPRINT_ERR

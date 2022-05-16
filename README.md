@@ -8,12 +8,10 @@ Supports creating, opening, reading, writing and closing files on local or remot
 
 #### Server
 1. Run `make watdfs_server` command to generate `watdfs_server`
-2. Run:
-      `./watdfs_server path_to_remote_directory`
+2. Run: `./watdfs_server path_to_remote_directory`<br/>
    This will give servers address and port it is listening on
 
 #### Client
 1. Run `make watdfs_client` command to generate `watdfs_client`
-2. On client machine store environment variables `SERVER_ADDRESS`, `SERVER_PORT` and `CACHE_INTERVAL_SEC`
-3. On client machine run:
-      `./watdfs_client -s -f -o direct_io path_to_cache_directory path_to_mouting_directory`
+2. Store environment variables `SERVER_ADDRESS`, `SERVER_PORT` and `CACHE_INTERVAL_SEC`
+3. Run: `./watdfs_client -s -f -o direct_io path_to_cache_directory path_to_mouting_directory`
